@@ -4,7 +4,7 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    tools:context="timeline.lizimumu.com.t.ui.DetailActivity">
+    tools:context="com.application.appsmonitor.t.ui.DetailActivity">
 
     <RelativeLayout
         android:id="@+id/rr_header"

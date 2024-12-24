@@ -1,4 +1,4 @@
-package timeline.lizimumu.com.t;
+package com.application.appsmonitor.t;
 
 import android.content.Context;
 import androidx.test.platform.app.InstrumentationRegistry;
@@ -21,6 +21,6 @@ public class ExampleInstrumentedTest {
         // Context of the app under test.
         Context appContext = InstrumentationRegistry.getTargetContext();
 
-        assertEquals("timeline.lizimumu.com.appstimeline", appContext.getPackageName());
+        assertEquals("com.application.appsmonitor.appstimeline", appContext.getPackageName());
     }
 }

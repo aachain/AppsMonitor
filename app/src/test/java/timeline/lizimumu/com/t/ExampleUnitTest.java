@@ -1,4 +1,4 @@
-package timeline.lizimumu.com.t;
+package com.application.appsmonitor.t;
 
 import org.junit.Test;
 
