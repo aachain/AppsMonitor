@@ -164,26 +164,6 @@ public class DetailActivity extends AppCompatActivity {
             });
         }
 
-        MobileAds.initialize(this, new OnInitializationCompleteListener() {
-            @Override
-            public void onInitializationComplete(InitializationStatus initializationStatus) {
-            }
-        });
-
-        AdView mAdView = findViewById(R.id.adView);
-        AdRequest adRequest = new AdRequest.Builder().build();
-        mAdView.loadAd(adRequest);
-        mAdView.setAdListener(new AdListener() {
-            @Override
-            public void onAdLoaded() {
-                Log.d(">>>>====----> AD", "AD.LOAD");
-            }
-
-            @Override
-            public void onAdFailedToLoad(int i) {
-                Log.d(">>>>====----> AD", "AD.LOAD.ERROR." + i);
-            }
-        });
     }
 
     @Override
