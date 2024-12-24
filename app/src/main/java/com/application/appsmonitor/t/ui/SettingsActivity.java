@@ -86,18 +86,18 @@ public class SettingsActivity extends AppCompatActivity {
         });
 
         // share
-        findViewById(R.id.group_share).setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                String shareText = getResources().getString(R.string.share_desc);
-                Intent sendIntent = new Intent();
-                sendIntent.setAction(Intent.ACTION_SEND);
-                sendIntent.putExtra(Intent.EXTRA_TEXT,
-                        String.format(Locale.getDefault(), shareText, AppConst.GP_DETAIL_PREFIX, BuildConfig.APPLICATION_ID));
-                sendIntent.setType("text/plain");
-                startActivity(sendIntent);
-            }
-        });
+        // findViewById(R.id.group_share).setOnClickListener(new View.OnClickListener() {
+        //     @Override
+        //     public void onClick(View view) {
+        //         String shareText = getResources().getString(R.string.share_desc);
+        //         Intent sendIntent = new Intent();
+        //         sendIntent.setAction(Intent.ACTION_SEND);
+        //         sendIntent.putExtra(Intent.EXTRA_TEXT,
+        //                 String.format(Locale.getDefault(), shareText, AppConst.GP_DETAIL_PREFIX, BuildConfig.APPLICATION_ID));
+        //         sendIntent.setType("text/plain");
+        //         startActivity(sendIntent);
+        //     }
+        // });
 
         restoreStatus();
     }

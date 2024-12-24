@@ -9,7 +9,7 @@ import android.provider.BaseColumns;
 
 final class DbConst {
 
-    static final String DATABASE_NAME = "timeline";
+    static final String DATABASE_NAME = "appsmonitor";
 
     private DbConst() {
     }
