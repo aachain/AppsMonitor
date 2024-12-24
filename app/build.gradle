@@ -17,30 +17,29 @@ android {
         versionName "1.9.2"
     }
 
+    signingConfigs {
+        release {
+            storeFile file("keystore.jks")
+            storePassword "app123456"
+            keyAlias "appkeystore"
+            keyPassword "app123456"
+        }
+    }
 
     // 
     buildTypes {
-        // 
         release {
-            // 
             minifyEnabled true
-            // 
             debuggable false
-            // 
             jniDebuggable false
-            // 
             zipAlignEnabled true
-            // 
             shrinkResources true
-            // 
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
-
+            signingConfig signingConfigs.release
         }
     }
     lintOptions {
-        // 
         checkReleaseBuilds false
-        // 
         abortOnError false
     }
     android.applicationVariants.all { variant ->
