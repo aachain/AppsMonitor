@@ -1,20 +1,13 @@
-//  Android App
 apply plugin: 'com.android.application'
 
 android {
-    // 29
     compileSdkVersion 29
     defaultConfig {
-        //  com.application.appsmonitor.t
         applicationId "com.application.appsmonitor.t"
-        // 22
         minSdkVersion 22
-        // 29
         targetSdkVersion 29
-        // 29
         versionCode 29
-        // 1.9.2
-        versionName "1.9.2"
+        versionName "1.0.0"
     }
 
     signingConfigs {
@@ -26,7 +19,6 @@ android {
         }
     }
 
-    // 
     buildTypes {
         release {
             minifyEnabled true
@@ -43,23 +35,19 @@ android {
         abortOnError false
     }
     android.applicationVariants.all { variant ->
-        //  AppsMonitor-1.9.2.apk
         variant.outputs.all {
-            outputFileName = "AppsMonitor-${defaultConfig.versionName}.apk"
+            outputFileName = "AppsMonitor.apk"
         }
     }
 }
 
-//  all projects
 allprojects {
-    // 
     repositories {
         google()
         jcenter()
     }
 }
 
-//  mavenCentral
 repositories {
     mavenCentral()
     google()
