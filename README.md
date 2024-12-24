@@ -36,3 +36,7 @@ zhishoumowen@gmail.com
 
 ## Thanks
 ![MIT](https://img.shields.io/npm/l/vue.svg)
+
+
+
+keytool -genkeypair -v -keystore keystore.jks -keyalg RSA -keysize 2048 -validity 10000 -alias myKeyAlias
