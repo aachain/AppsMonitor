@@ -57,7 +57,7 @@
             android:layout_centerVertical="true"
             android:background="@drawable/bg_button"
             android:minHeight="0dp"
-            android:text="@string/open"
+            android:text="@string/close"
             android:textColor="@android:color/white" />
     </RelativeLayout>
 
