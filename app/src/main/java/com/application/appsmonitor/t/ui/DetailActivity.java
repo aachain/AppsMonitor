@@ -3,6 +3,9 @@ package com.application.appsmonitor.t.ui;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.ActivityManager; // 添加此行
+import android.app.admin.DevicePolicyManager;
+import android.content.ComponentName;
+
 import android.app.usage.NetworkStats;
 import android.app.usage.NetworkStatsManager;
 import android.app.usage.UsageEvents;
@@ -65,6 +68,9 @@ import com.application.appsmonitor.t.util.SortEnum;
 
 public class DetailActivity extends AppCompatActivity {
 
+    private static final int REQUEST_CODE_ENABLE_ADMIN = 1;
+    private ComponentName adminComponent;
+
     public static final String EXTRA_PACKAGE_NAME = "package_name";
     public static final String EXTRA_DAY = "day";
 
@@ -81,6 +87,9 @@ public class DetailActivity extends AppCompatActivity {
         getWindow().requestFeature(Window.FEATURE_CONTENT_TRANSITIONS);
         getWindow().setExitTransition(new Explode());
         setContentView(R.layout.activity_detail);
+
+        // 初始化设备管理员组件
+        adminComponent = new ComponentName(this, com.application.appsmonitor.t.receiver.AdminReceiver.class);
 
         mProgress = findViewById(R.id.progressBar);
 
@@ -126,12 +135,7 @@ public class DetailActivity extends AppCompatActivity {
                     @Override
                     public void onClick(View view) {
                         // startActivity(LaunchIntent);
-                        try {
-                            ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
-                            am.killBackgroundProcesses(mPackageName);
-                        } catch (Exception e) {
-                            e.printStackTrace();
-                        }
+                        requestAdminPermissions();
                     }
                 });
             }
@@ -172,6 +176,30 @@ public class DetailActivity extends AppCompatActivity {
         }
 
     }
+
+    private void requestAdminPermissions() {
+        Intent intent = new Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN);
+        intent.putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent);
+        intent.putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "需要设备管理员权限以强制关闭应用");
+        startActivityForResult(intent, REQUEST_CODE_ENABLE_ADMIN);
+    }
+
+    
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_CODE_ENABLE_ADMIN) {
+            if (resultCode == Activity.RESULT_OK) {
+                // 权限已获得
+                // 可以执行其他操作
+                Toast.makeText(this, "设备管理员权限已获得", Toast.LENGTH_SHORT).show();
+            } else {
+                // 权限未获得
+                Toast.makeText(this, "设备管理员权限未获得", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
 
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
