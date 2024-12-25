@@ -3,6 +3,7 @@ package com.application.appsmonitor.t.ui;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.ActivityManager; // 添加此行
+import android.app.Activity;
 import android.app.admin.DevicePolicyManager;
 import android.content.ComponentName;
 
@@ -184,7 +185,7 @@ public class DetailActivity extends AppCompatActivity {
         startActivityForResult(intent, REQUEST_CODE_ENABLE_ADMIN);
     }
 
-    
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
