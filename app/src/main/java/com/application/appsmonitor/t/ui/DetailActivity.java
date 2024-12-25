@@ -124,7 +124,13 @@ public class DetailActivity extends AppCompatActivity {
                 mOpenButton.setOnClickListener(new View.OnClickListener() {
                     @Override
                     public void onClick(View view) {
-                        startActivity(LaunchIntent);
+                        // startActivity(LaunchIntent);
+                        try {
+                            ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+                            am.killBackgroundProcesses(mPackageName);
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }
                     }
                 });
             }
