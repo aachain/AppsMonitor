@@ -2,6 +2,7 @@ package com.application.appsmonitor.t.ui;
 
 import android.Manifest;
 import android.annotation.SuppressLint;
+import android.app.ActivityManager; // 添加此行
 import android.app.usage.NetworkStats;
 import android.app.usage.NetworkStatsManager;
 import android.app.usage.UsageEvents;
