@@ -148,7 +148,7 @@ public final class AppUtil {
         cal.set(Calendar.SECOND, 0);
         cal.set(Calendar.MILLISECOND, 0);
         long start = cal.getTimeInMillis();
-        long end = start + A_DAY > timeNow ? timeNow : start + A_DAY;
+        long end = start + A_DAY;
         return new long[]{start, end};
     }
 
@@ -161,7 +161,7 @@ public final class AppUtil {
         cal.set(Calendar.SECOND, 0);
         cal.set(Calendar.MILLISECOND, 0);
         long start = cal.getTimeInMillis();
-        long end = start + A_DAY > timeNow ? timeNow : start + A_DAY;
+        long end = start + 7 * A_DAY > timeNow ? timeNow : start + 7 * A_DAY;
         return new long[]{start, end};
     }
 

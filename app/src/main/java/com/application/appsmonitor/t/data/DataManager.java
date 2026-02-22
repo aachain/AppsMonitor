@@ -60,10 +60,24 @@ public class DataManager {
     }
 
     public boolean hasPermission(Context context) {
-        AppOpsManager appOps = (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
-        if (appOps != null) {
-            int mode = appOps.checkOpNoThrow("android:get_usage_stats", android.os.Process.myUid(), context.getPackageName());
-            return mode == AppOpsManager.MODE_ALLOWED;
+        try {
+            AppOpsManager appOps = (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
+            if (appOps != null) {
+                int mode = appOps.checkOpNoThrow("android:get_usage_stats", android.os.Process.myUid(), context.getPackageName());
+                if (mode != AppOpsManager.MODE_ALLOWED) {
+                    return false;
+                }
+                // 尝试查询以验证权限是否真的有效（小米 HyperOS 兼容性检查）
+                UsageStatsManager manager = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
+                if (manager != null) {
+                    long endTime = System.currentTimeMillis();
+                    long startTime = endTime - 3600 * 1000; // 查询过去1小时
+                    UsageEvents events = manager.queryEvents(startTime, endTime);
+                    return events != null;
+                }
+            }
+        } catch (Exception e) {
+            Log.e("DataManager", "Permission check error: " + e.getMessage(), e);
         }
         return false;
     }
@@ -75,6 +89,13 @@ public class DataManager {
 
             long[] range = AppUtil.getTimeRange(SortEnum.getSortEnum(offset));
             UsageEvents events = manager.queryEvents(range[0], range[1]);
+            
+            // 检查 events 是否为null或没有数据
+            if (events == null) {
+                Log.w("DataManager", "queryEvents returned null for range: " + range[0] + " ~ " + range[1]);
+                return items;
+            }
+            
             UsageEvents.Event event = new UsageEvents.Event();
 
             AppItem item = new AppItem();
@@ -139,7 +160,16 @@ public class DataManager {
             Map<String, ClonedEvent> endPoints = new HashMap<>();
             // 获取事件
             long[] range = AppUtil.getTimeRange(SortEnum.getSortEnum(offset));
+            Log.d("DataManager", "Querying events from " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[0])) 
+                    + " to " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[1])));
             UsageEvents events = manager.queryEvents(range[0], range[1]);
+            
+            // 检查 events 是否为null
+            if (events == null) {
+                Log.w("DataManager", "queryEvents returned null for range: " + range[0] + " ~ " + range[1]);
+                return newList;
+            }
+            
             UsageEvents.Event event = new UsageEvents.Event();
             while (events.hasNextEvent()) {
                 // 解析时间
@@ -186,11 +216,15 @@ public class DataManager {
                     prevPackage = eventPackage;
                 }
             }
+        } else {
+            Log.e("DataManager", "UsageStatsManager is null");
         }
         // 按照使用时长排序
+        Map<String, Long> mobileData = new HashMap<>();
+        boolean valid = false;
+        
         if (items.size() > 0) {
-            boolean valid = false;
-            Map<String, Long> mobileData = new HashMap<>();
+            Log.d("DataManager", "Found " + items.size() + " apps with usage data");
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 valid = true;
                 NetworkStatsManager networkStatsManager = (NetworkStatsManager) context.getSystemService(Context.NETWORK_STATS_SERVICE);
