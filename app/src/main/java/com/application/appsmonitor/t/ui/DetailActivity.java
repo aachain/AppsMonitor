@@ -410,7 +410,8 @@ public class DetailActivity extends AppCompatActivity {
                     }
                     newList.add(item);
                 }
-                mTime.setText(String.format(getResources().getString(R.string.times), AppUtil.formatMilliSeconds(duration), appItems.get(appItems.size() - 1).mCount));
+                int lastCount = appItems.isEmpty() ? 0 : appItems.get(appItems.size() - 1).mCount;
+                mTime.setText(String.format(getResources().getString(R.string.times), AppUtil.formatMilliSeconds(duration), lastCount));
                 mAdapter.setData(newList);
             }
         }
