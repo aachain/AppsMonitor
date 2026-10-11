@@ -56,6 +56,9 @@ public class DataManager {
     // 单个会话合理上限（4 小时）：HyperOS 漏发 END 时 open session 会被补结算到
     // range[1]；若无上限会把“忘记关的前台应用”膨胀成整天数据。
     private static final long MAX_SESSION_MS = 4L * 3600L * 1000L;
+    // 同一次退出会连续发出 PAUSED(2) 与 STOPPED(23) 两个事件，第二个是重复事件；
+    // 若按“半开会话”处理会用 range[0] 兜出幽灵时长（如 0:00~2:00），必须去重跳过
+    private static final long DUP_END_WINDOW_MS = 60L * 1000L;
 
     private static DataManager mInstance;
 
@@ -125,6 +128,7 @@ public class DataManager {
         UsageEvents events = manager.queryEvents(range[0], range[1]);
         if (events != null) {
             long start = 0;
+            long lastEnd = 0;
             UsageEvents.Event event = new UsageEvents.Event();
             while (events.hasNextEvent()) {
                 events.getNextEvent(event);
@@ -134,6 +138,7 @@ public class DataManager {
                 long t = event.getTimeStamp();
                 if (type == EVENT_START) {
                     if (start == 0) {
+                        lastEnd = 0;
                         start = t;
                         AppItem fg = template.copy();
                         fg.mEventTime = t;
@@ -142,6 +147,11 @@ public class DataManager {
                         items.add(fg);
                     }
                 } else if (type == EVENT_END_PAUSED || type == EVENT_END_STOPPED) {
+                    // 同一次退出会连发 PAUSED+STOPPED；start 已结算归零后短时间内的
+                    // 重复 END 必须跳过，否则会当半开会话用 range[0] 兜出幽灵时长
+                    if (start == 0 && lastEnd > 0 && t - lastEnd < DUP_END_WINDOW_MS) {
+                        continue;
+                    }
                     // 半开 session：目标 app 的 START 落在 range[0] 之前，用 range[0] 兜住起点
                     long s = start > 0 ? start : range[0];
                     if (t > s) {
@@ -162,6 +172,7 @@ public class DataManager {
                         if (bg.mUsageTime > AppConst.USAGE_TIME_MIX) bg.mCount = 1;
                         items.add(bg);
                         pairedSessions++;
+                        lastEnd = t;
                         start = 0;
                     }
                 }
@@ -201,6 +212,7 @@ public class DataManager {
             Log.d(TAG, "Querying events from " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[0]))
                     + " to " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[1])));
             Map<String, Long> startPoints = new HashMap<>();
+            Map<String, Long> lastEndTimes = new HashMap<>();
             Map<String, AppItem> itemsByPkg = new HashMap<>();
             int totalEvents = 0;
             int pairedSessions = 0;
@@ -217,6 +229,8 @@ public class DataManager {
                     String eventPackage = event.getPackageName();
                     if (TextUtils.isEmpty(eventPackage)) continue;
                     if (eventType == EVENT_START) {
+                        // 新会话开始，清除“刚结算”标记，保证后续 END 正常配对
+                        lastEndTimes.remove(eventPackage);
                         // HyperOS 平板多窗口常见：新应用 RESUMED 到达但旧应用的 END/PAUSED/STOPPED 漏发。
                         // 先把除当前 pkg 外仍挂在 startPoints 里的“孤儿会话”用当前时刻隐式结算。
                         Iterator<Map.Entry<String, Long>> it = startPoints.entrySet().iterator();
@@ -250,6 +264,15 @@ public class DataManager {
                         }
                     } else if (eventType == EVENT_END_PAUSED || eventType == EVENT_END_STOPPED) {
                         Long startObj = startPoints.remove(eventPackage);
+                        if (startObj == null) {
+                            // 无对应 START：可能是同一次退出的重复 END（PAUSED 已配对，STOPPED 又来），
+                            // 也可能是真正跨 range[0] 的半开会话。短时间内的重复 END 必须跳过，
+                            // 否则会凭空多出 range[0]→事件时间 的幽灵时长
+                            Long lastEnd = lastEndTimes.get(eventPackage);
+                            if (lastEnd != null && eventTime - lastEnd < DUP_END_WINDOW_MS) {
+                                continue;
+                            }
+                        }
                         // 半开 session：END 落在窗口内但 START 在窗口之前（跨 range[0]），
                         // 用 range[0] 兜住起点，避免整段使用被丢弃。
                         long start = startObj != null ? startObj : range[0];
@@ -267,6 +290,7 @@ public class DataManager {
                             item.mUsageTime += duration;
                             if (duration > AppConst.USAGE_TIME_MIX) item.mCount++;
                             pairedSessions++;
+                            lastEndTimes.put(eventPackage, eventTime);
                         }
                     }
                 }
