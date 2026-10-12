@@ -31,6 +31,9 @@
     <string name="notification_message">monitoring your app usage</string>
     <string name="not_support">You device not support monitoring</string>
 
+    <string name="monitor_channel_name">使用时长提醒</string>
+    <string name="monitor_reminder">%1$s 已使用 %2$d 分钟，还剩 %3$d 分钟</string>
+
     <string name="open">Open</string>
 
     <string name="refresh">Refresh</string>
