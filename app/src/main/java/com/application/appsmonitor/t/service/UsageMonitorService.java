@@ -24,6 +24,7 @@ import com.application.appsmonitor.t.data.DataManager;
 import com.application.appsmonitor.t.ui.MainActivity;
 import com.application.appsmonitor.t.util.AppUtil;
 import com.application.appsmonitor.t.util.PreferenceManager;
+import com.application.appsmonitor.t.util.RouterUtil;
 
 /**
  * UsageMonitorService
@@ -103,6 +104,66 @@ public class UsageMonitorService extends Service {
                 if (remaining < 0) remaining = 0;
                 postAlert(pkg, usedMin, remaining);
             }
+            // 超上限（剩余 < 0）→ 通过路由器后台拉黑本设备，一天只触发一次
+            if (AppConst.MONITOR_ROUTER_BLOCK_ON_OVERDUE
+                    && usedMin > AppConst.MONITOR_DAILY_LIMIT_MIN) {
+                String blockKey = "block_" + pkg + "_" + today;
+                if (!PreferenceManager.getInstance().getBoolean(blockKey)) {
+                    PreferenceManager.getInstance().putBoolean(blockKey, true);
+                    triggerRouterBlock(pkg, usedMin);
+                }
+            }
+        }
+    }
+
+    /**
+     * 拉黑操作包含同步 HTTP 请求，必须离开主线程；失败后回滚当天去重标记，
+     * 下一轮轮询还可以重试（例如路由器刚重启、瞬时不可达的情况）。
+     */
+    private void triggerRouterBlock(final String pkg, final int usedMin) {
+        final String today = new SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(new Date());
+        final String blockKey = "block_" + pkg + "_" + today;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final boolean ok = RouterUtil.blockTargetDevice();
+                if (!ok) {
+                    PreferenceManager.getInstance().putBoolean(blockKey, false);
+                }
+                mHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        postBlockAlert(pkg, usedMin, ok);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void postBlockAlert(String pkg, int usedMin, boolean success) {
+        String appName = AppUtil.parsePackageName(getPackageManager(), pkg);
+        String text = success
+                ? getString(R.string.monitor_block_done, appName, usedMin)
+                : getString(R.string.monitor_block_fail);
+
+        Intent i = new Intent(this, MainActivity.class);
+        i.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        int piFlags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            piFlags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        PendingIntent pi = PendingIntent.getActivity(this, ("blk_" + pkg).hashCode(), i, piFlags);
+
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_ALERT)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle(appName)
+                .setContentText(text)
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(text))
+                .setAutoCancel(true)
+                .setContentIntent(pi)
+                .setPriority(NotificationCompat.PRIORITY_HIGH);
+        if (mNotifier != null) {
+            mNotifier.notify(("block_" + pkg).hashCode(), builder.build());
         }
     }
 
