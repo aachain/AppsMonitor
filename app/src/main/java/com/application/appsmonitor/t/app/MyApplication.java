@@ -3,6 +3,8 @@ package com.application.appsmonitor.t.app;
 import android.app.Application;
 import android.content.Intent;
 
+import androidx.core.content.ContextCompat;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -13,6 +15,7 @@ import com.application.appsmonitor.t.data.DataManager;
 import com.application.appsmonitor.t.db.DbHistoryExecutor;
 import com.application.appsmonitor.t.db.DbIgnoreExecutor;
 import com.application.appsmonitor.t.service.AppService;
+import com.application.appsmonitor.t.service.UsageMonitorService;
 import com.application.appsmonitor.t.util.CrashHandler;
 import com.application.appsmonitor.t.util.PreferenceManager;
 
@@ -28,6 +31,7 @@ public class MyApplication extends Application {
         super.onCreate();
         PreferenceManager.init(this);
         getApplicationContext().startService(new Intent(getApplicationContext(), AppService.class));
+        ContextCompat.startForegroundService(this, new Intent(this, UsageMonitorService.class));
         DbIgnoreExecutor.init(getApplicationContext());
         DbHistoryExecutor.init(getApplicationContext());
         DataManager.init();
