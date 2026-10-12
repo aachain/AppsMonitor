@@ -7,9 +7,11 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
+import android.provider.Settings;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
@@ -23,6 +25,7 @@ import com.application.appsmonitor.t.R;
 import com.application.appsmonitor.t.data.DataManager;
 import com.application.appsmonitor.t.ui.MainActivity;
 import com.application.appsmonitor.t.util.AppUtil;
+import com.application.appsmonitor.t.util.MonitorAlarmUtil;
 import com.application.appsmonitor.t.util.PreferenceManager;
 import com.application.appsmonitor.t.util.RouterUtil;
 
@@ -57,17 +60,25 @@ public class UsageMonitorService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        // 进程被闹钟/开机广播冷拉起时，MyApplication 一般已先行初始化；
+        // 这里再兼容一次，防止个别时序下 getInstance() 返回 null
+        if (DataManager.getInstance() == null) DataManager.init();
         mNotifier = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         createChannels();
         startForeground(ONGOING_NOTIF_ID, buildOngoingNotification());
         mHandler = new Handler();
+        // 引导用户把本应用加入电池优化白名单（HyperOS 后台冻结的首要对策）；
+        // 未授权时跳一次设置页，用户确认后系统会记住，不再重复弹
+        requestIgnoreBatteryOptimizations();
     }
 
     @Override
     public int onStartCommand(@Nullable Intent intent, int flags, int startId) {
-        // 保证只挂一个轮询任务
+        // Handler 轮询只在进程存活且未被冻结时有效，保留作前台双保险
         mHandler.removeCallbacks(mPoll);
         mHandler.post(mPoll);
+        // 关键：闹钟链交给系统 AlarmManager，无论 App 在前台/后台/被杀都能每分钟唤醒检查
+        MonitorAlarmUtil.scheduleAlarm(this);
         return START_STICKY;
     }
 
@@ -83,6 +94,37 @@ public class UsageMonitorService extends Service {
             mHandler.removeCallbacks(mPoll);
         }
         super.onDestroy();
+        // 进程还活着时被杀：续排闹钟并尽量自拉起，保证后台提醒链不断；
+        // 闹钟本身由系统保管，即使这里拉起失败，下一分钟 MonitorAlarmReceiver 仍会把服务带回来
+        MonitorAlarmUtil.scheduleAlarm(this);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(new Intent(this, UsageMonitorService.class));
+            } else {
+                startService(new Intent(this, UsageMonitorService.class));
+            }
+        } catch (Exception e) {
+            // 后台启动受限时静默，依赖闹钟链
+        }
+    }
+
+    /**
+     * Android 6+ 引导用户将本应用加入电池优化白名单。
+     * HyperOS/MIUI 的“省电策略=无限制”底层就映射到这个设置；
+     * 已被豁免时不重复打扰；跳设置页失败（个别 ROM 不支持该 action）则静默跳过。
+     */
+    private void requestIgnoreBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null && pm.isIgnoringBatteryOptimizations(getPackageName())) return;
+            Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+            i.setData(Uri.parse("package:" + getPackageName()));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception e) {
+            // 无对应设置页等异常，不影响监控主流程
+        }
     }
 
     private void checkAll() {
