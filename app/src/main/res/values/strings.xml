@@ -33,6 +33,12 @@
 
     <string name="monitor_channel_name">使用时长提醒</string>
     <string name="monitor_reminder">%1$s 已使用 %2$d 分钟，还剩 %3$d 分钟</string>
+    <string name="monitor_block_done">%1$s 今日已使用 %2$d 分钟，超过上限，路由器已拉黑本设备断网</string>
+    <string name="monitor_block_fail">尝试拉黑本设备失败（路由器不可达或接口变更）</string>
+    <string name="monitor_confirm_title">确认断网？</string>
+    <string name="monitor_confirm_message">确定后将向路由器下发拉黑指令，本设备会立即失去外网；恢复需要手动进入路由器管理页取消拉黑。</string>
+    <string name="monitor_confirm_ok">确定断网</string>
+    <string name="monitor_confirm_cancel">取消</string>
 
     <string name="open">Open</string>
 
