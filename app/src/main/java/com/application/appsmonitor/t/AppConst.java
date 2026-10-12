@@ -33,6 +33,8 @@ public final class AppConst {
     // public static final int[] MONITOR_TIERS_MIN = {1, 20, 55, 115};
     // 轮询间隔（毫秒）
     public static final long MONITOR_CHECK_INTERVAL_MS = 60 * 1000L;
+    // 每分钟精确唤醒闹钟的 action（由系统 AlarmManager 触发，应用退后台/被杀也能弹提醒）
+    public static final String MONITOR_ALARM_ACTION = "MONITOR_ALARM_RECEIVER";
 
     // ===== 超上限自动断网（通过 TP-LINK TL-WDR7650 路由后台 API 拉黑设备）=====
     // 命中条件：当日已用分钟数 > MONITOR_DAILY_LIMIT_MIN（即“剩余 < 0”）
