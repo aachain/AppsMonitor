@@ -77,6 +77,12 @@ public class DataManager {
      * 查询指定包“今天 00:00 到现在”的前台累计时长（毫秒）。
      * 用于实时监控服务轮询判断是否达到提醒档位。
      * 未授予使用情况访问权限时返回 0（不会产生误报）。
+     *
+     * 关键：必须用 queryEvents 配对，并把“当前仍在前台、尚未结算的 open session”
+     * 补算到 now——因为 queryUsageStats().getTotalTimeInForeground() 只统计“已经
+     * 结束的前后台会话”，正在运行的 App 那一段根本不计入。若沿用 queryUsageStats，
+     * 就会出现“正开着被监控 App 时读数一直是 0、永远够不到提醒档位”的问题。
+     * 仅当整个事件流对该包一条事件都没有时（个别 HyperOS 机型行为），才退回 queryUsageStats 兜底。
      */
     public long getTodayUsageMillis(Context context, String pkg) {
         if (TextUtils.isEmpty(pkg)) return 0;
@@ -85,20 +91,73 @@ public class DataManager {
         if (manager == null) return 0;
         long[] range = AppUtil.getTimeRange(SortEnum.TODAY);
         long total = 0;
+        long openStart = 0;
+        boolean seen = false;
+        int eventCount = 0;
         try {
-            // INTERVAL_DAILY 桶边界为日历 00:00，与“今天”起点对齐；按包聚合多天 bucket 求和。
-            List<UsageStats> stats = manager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, range[0], range[1]);
-            if (stats != null) {
-                for (UsageStats s : stats) {
-                    if (s != null && pkg.equals(s.getPackageName())) {
-                        total += s.getTotalTimeInForeground();
+            UsageEvents events = manager.queryEvents(range[0], range[1]);
+            if (events != null) {
+                UsageEvents.Event event = new UsageEvents.Event();
+                while (events.hasNextEvent()) {
+                    events.getNextEvent(event);
+                    if (!pkg.equals(event.getPackageName())) continue;
+                    eventCount++;
+                    int type = event.getEventType();
+                    long t = event.getTimeStamp();
+                    if (type == EVENT_START) {
+                        // 只跟踪一个进行中的会话：已 open 时忽略重复 START
+                        if (openStart == 0) {
+                            seen = true;
+                            openStart = t;
+                        }
+                    } else if (type == EVENT_END_PAUSED || type == EVENT_END_STOPPED) {
+                        if (openStart == 0) {
+                            // 找不到配对 START：本流已见过 START → 是同一次退出的重复 END（PAUSED/STOPPED 双发），跳过
+                            if (seen) continue;
+                            // 本流从未出现 START 的 END：跨零点半开会话，用 range[0] 兜住起点
+                            seen = true;
+                            openStart = range[0];
+                        }
+                        long dur = t - openStart;
+                        if (dur < 0) dur = 0;
+                        if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
+                        total += dur;
+                        openStart = 0;
                     }
                 }
             }
+            // 结算仍在前台的当前会话（这正是 queryUsageStats 读不到的那一段）
+            if (openStart > 0 && range[1] > openStart) {
+                long dur = range[1] - openStart;
+                if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
+                total += dur;
+            }
         } catch (Exception e) {
-            Log.e(TAG, "getTodayUsageMillis error: " + e.getMessage(), e);
+            Log.e(TAG, "getTodayUsageMillis events error: " + e.getMessage(), e);
+        }
+        // 事件流对该包一条都没有时，退回 queryUsageStats 汇总（不含进行中会话，但聊胜于无）
+        if (eventCount == 0) {
+            long fallback = 0;
+            try {
+                List<UsageStats> stats = manager.queryUsageStats(
+                        UsageStatsManager.INTERVAL_DAILY, range[0], range[1]);
+                if (stats != null) {
+                    for (UsageStats s : stats) {
+                        if (s != null && pkg.equals(s.getPackageName())) {
+                            fallback += s.getTotalTimeInForeground();
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "getTodayUsageMillis fallback error: " + e.getMessage(), e);
+            }
+            Log.w(TAG, "getTodayUsageMillis events empty for " + pkg
+                    + ", fallback queryUsageStats=" + (fallback / 1000) + "s");
+            total = fallback;
         }
         if (total < 0) total = 0;
+        Log.d(TAG, "getTodayUsageMillis " + pkg + " events=" + eventCount
+                + " total=" + (total / 1000) + "s");
         return total;
     }
 
