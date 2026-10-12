@@ -73,6 +73,35 @@ public class DataManager {
         return mInstance;
     }
 
+    /**
+     * 查询指定包“今天 00:00 到现在”的前台累计时长（毫秒）。
+     * 用于实时监控服务轮询判断是否达到提醒档位。
+     * 未授予使用情况访问权限时返回 0（不会产生误报）。
+     */
+    public long getTodayUsageMillis(Context context, String pkg) {
+        if (TextUtils.isEmpty(pkg)) return 0;
+        if (!hasPermission(context)) return 0;
+        UsageStatsManager manager = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
+        if (manager == null) return 0;
+        long[] range = AppUtil.getTimeRange(SortEnum.TODAY);
+        long total = 0;
+        try {
+            // INTERVAL_DAILY 桶边界为日历 00:00，与“今天”起点对齐；按包聚合多天 bucket 求和。
+            List<UsageStats> stats = manager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, range[0], range[1]);
+            if (stats != null) {
+                for (UsageStats s : stats) {
+                    if (s != null && pkg.equals(s.getPackageName())) {
+                        total += s.getTotalTimeInForeground();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "getTodayUsageMillis error: " + e.getMessage(), e);
+        }
+        if (total < 0) total = 0;
+        return total;
+    }
+
     public void requestPermission(Context context) {
         Intent intent = new Intent(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS));
         intent.setFlags(FLAG_ACTIVITY_NEW_TASK);
