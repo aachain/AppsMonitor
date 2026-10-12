@@ -11,6 +11,7 @@ import android.app.usage.NetworkStats;
 import android.app.usage.NetworkStatsManager;
 import android.app.usage.UsageEvents;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
@@ -26,6 +27,7 @@ import android.os.RemoteException;
 import androidx.annotation.NonNull;
 import androidx.core.app.ActivityCompat;
 import androidx.appcompat.app.ActionBar;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.palette.graphics.Palette;
 import androidx.recyclerview.widget.LinearLayoutManager;
@@ -65,6 +67,7 @@ import com.application.appsmonitor.t.data.DataManager;
 import com.application.appsmonitor.t.db.DbIgnoreExecutor;
 import com.application.appsmonitor.t.util.AppUtil;
 import com.application.appsmonitor.t.util.BitmapUtil;
+import com.application.appsmonitor.t.util.RouterUtil;
 import com.application.appsmonitor.t.util.SortEnum;
 
 public class DetailActivity extends AppCompatActivity {
@@ -127,19 +130,14 @@ public class DetailActivity extends AppCompatActivity {
             mTime = findViewById(R.id.time);
             // action
             final Button mOpenButton = findViewById(R.id.open);
-            final Intent LaunchIntent = getPackageManager().getLaunchIntentForPackage(mPackageName);
-            if (LaunchIntent == null) {
-                mOpenButton.setClickable(false);
-                mOpenButton.setAlpha(0.5f);
-            } else {
-                mOpenButton.setOnClickListener(new View.OnClickListener() {
-                    @Override
-                    public void onClick(View view) {
-                        // startActivity(LaunchIntent);
-                        requestAdminPermissions();
-                    }
-                });
-            }
+            // 统一行为：不再区分是否有启动器，也不再申请设备管理员；
+            // 点“Close” = 弹确认框；确认后才调用路由器拉黑本设备断网。
+            mOpenButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    showBlockConfirmDialog();
+                }
+            });
             // list
             RecyclerView mList = findViewById(R.id.list);
             mList.setLayoutManager(new LinearLayoutManager(this));
@@ -183,6 +181,53 @@ public class DetailActivity extends AppCompatActivity {
         intent.putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent);
         intent.putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "需要设备管理员权限以强制关闭应用");
         startActivityForResult(intent, REQUEST_CODE_ENABLE_ADMIN);
+    }
+
+    /**
+     * 断网确认弹框，防误触。默认选“取消”，点外部区域不自动关闭；
+     * Activity 正在销毁时不弹，避免 WindowLeaked。
+     */
+    private void showBlockConfirmDialog() {
+        if (isFinishing() || isDestroyed()) return;
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.monitor_confirm_title)
+                .setMessage(R.string.monitor_confirm_message)
+                .setNegativeButton(R.string.monitor_confirm_cancel, null)
+                .setPositiveButton(R.string.monitor_confirm_ok, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        triggerRouterBlock();
+                    }
+                })
+                .setCancelable(true)
+                .show();
+    }
+
+    /**
+     * 向 TP-LINK 路由器发送“拉黑本设备 MAC”的指令，实现彻底断网。
+     * 同步 HTTP 必须离开主线程；结果用 Toast 在主线程告知。
+     * 与自动监控中的自动拉黑不同，手动点击失败时不去回滚任何去重标记，
+     * 因为手动入口本就不受当天去重限制。
+     */
+    private void triggerRouterBlock() {
+        Toast.makeText(this, "正在断开网络...", Toast.LENGTH_SHORT).show();
+        final long t0 = System.currentTimeMillis();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final boolean ok = RouterUtil.blockTargetDevice();
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        long cost = System.currentTimeMillis() - t0;
+                        String msg = ok
+                                ? "已拉黑本设备，网络已断开（耗时 " + cost + "ms）"
+                                : "断网失败：路由器不可达或接口变更（耗时 " + cost + "ms）";
+                        Toast.makeText(DetailActivity.this, msg, Toast.LENGTH_LONG).show();
+                    }
+                });
+            }
+        }).start();
     }
 
 
