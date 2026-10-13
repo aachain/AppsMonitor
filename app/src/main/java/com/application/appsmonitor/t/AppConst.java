@@ -17,11 +17,10 @@ public final class AppConst {
     // ===== 实时时长监控（固定档位提醒）配置 =====
     // 监控以下包名（可用 adb shell pm list packages 或“应用详情”页顶部 pkg_name 查看）。
     public static final String[] MONITOR_PACKAGES = {
-            "com.microsoft.emmx",   // Microsoft Edge
             "com.netease.party",    // 网易·蛋仔派对
     };
     // 每日使用上限（分钟），用于计算“还剩多少分钟”，同时也是触发拉黑的阈值
-    public static final int MONITOR_DAILY_LIMIT_MIN = 10;
+    public static final int MONITOR_DAILY_LIMIT_MIN = 120;
     // 固定提醒档位（已用分钟数达到即提醒一次，同日同档不重复）
     // 【测试配置】每 5 分钟提醒一次；测试交付前改回真实档位，
     // 并先清除 App 数据（去重键在 SharedPreferences里会跨重启保留）。
