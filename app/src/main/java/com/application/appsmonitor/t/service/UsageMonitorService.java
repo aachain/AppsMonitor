@@ -42,6 +42,13 @@ public class UsageMonitorService extends Service {
     private static final String CHANNEL_ONGOING = "usage_monitor_ongoing";
     private static final String CHANNEL_ALERT = "usage_monitor_alert";
 
+    /** 静态引用，用于外部判断服务是否存活 */
+    private static volatile UsageMonitorService sInstance;
+
+    public static boolean isRunning() {
+        return sInstance != null;
+    }
+
     private Handler mHandler;
     private NotificationManager mNotifier;
 
@@ -60,6 +67,7 @@ public class UsageMonitorService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        sInstance = this;
         // 进程被闹钟/开机广播冷拉起时，MyApplication 一般已先行初始化；
         // 这里再兼容一次，防止个别时序下 getInstance() 返回 null
         if (DataManager.getInstance() == null) DataManager.init();
@@ -70,6 +78,9 @@ public class UsageMonitorService extends Service {
         // 引导用户把本应用加入电池优化白名单（HyperOS 后台冻结的首要对策）；
         // 未授权时跳一次设置页，用户确认后系统会记住，不再重复弹
         requestIgnoreBatteryOptimizations();
+        // 调度看门狗闹钟 + JobScheduler（确保即使主闹钟链被清也能恢复）
+        MonitorAlarmUtil.scheduleWatchdog(this);
+        WatchdogJobService.schedule(this);
     }
 
     @Override
@@ -90,13 +101,15 @@ public class UsageMonitorService extends Service {
 
     @Override
     public void onDestroy() {
+        sInstance = null;
         if (mHandler != null) {
             mHandler.removeCallbacks(mPoll);
         }
         super.onDestroy();
-        // 进程还活着时被杀：续排闹钟并尽量自拉起，保证后台提醒链不断；
+        // 进程还活着时被杀：续排所有闹钟并尽量自拉起，保证后台提醒链不断；
         // 闹钟本身由系统保管，即使这里拉起失败，下一分钟 MonitorAlarmReceiver 仍会把服务带回来
         MonitorAlarmUtil.scheduleAlarm(this);
+        MonitorAlarmUtil.scheduleWatchdog(this);
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(new Intent(this, UsageMonitorService.class));
@@ -106,6 +119,34 @@ public class UsageMonitorService extends Service {
         } catch (Exception e) {
             // 后台启动受限时静默，依赖闹钟链
         }
+    }
+
+    /**
+     * 用户从最近任务划掉 App 时回调（配合 stopWithTask="false" 服务不会被立即销毁，
+     * 但 MIUI/HyperOS 可能随后杀进程）。这里主动续排闹钟 + 延迟重拉自己，
+     * 确保即使进程被回收，下一分钟闹钟仍会把服务带回来。
+     */
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        // 续排闹钟——MIUI 划任务不一定清闹钟，但做双保险
+        MonitorAlarmUtil.scheduleAlarm(this);
+        MonitorAlarmUtil.scheduleWatchdog(this);
+        // 延迟 1 秒后重启自身，给系统一点时间完成 task 移除动画
+        new Handler().postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(new Intent(UsageMonitorService.this, UsageMonitorService.class));
+                    } else {
+                        startService(new Intent(UsageMonitorService.this, UsageMonitorService.class));
+                    }
+                } catch (Exception e) {
+                    // 静默，依赖闹钟兆底
+                }
+            }
+        }, 1000L);
+        super.onTaskRemoved(rootIntent);
     }
 
     /**
