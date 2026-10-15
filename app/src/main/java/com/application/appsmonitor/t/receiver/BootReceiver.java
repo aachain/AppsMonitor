@@ -7,12 +7,14 @@ import android.content.Intent;
 import androidx.core.content.ContextCompat;
 
 import com.application.appsmonitor.t.service.UsageMonitorService;
+import com.application.appsmonitor.t.service.WatchdogJobService;
 import com.application.appsmonitor.t.util.MonitorAlarmUtil;
 
 /**
  * BootReceiver
  * 开机完成后拉起 {@link UsageMonitorService}，使实时时长监控在重启后自动恢复；
  * 同时重建每分钟唤醒闹钟链（AlarmManager 的闹钟不会跨重启保留）。
+ * 还处理 MY_PACKAGE_REPLACED：App 更新后系统发送此广播，确保服务不会被卸载安装流程弄丢。
  * Android 8.0+ 从后台广播只能以 startForegroundService 方式启动服务，
  * 服务本身在 onCreate 中立即调用 startForeground()，满足系统约束。
  */
@@ -21,8 +23,11 @@ public class BootReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
         String action = intent == null ? null : intent.getAction();
-        if (Intent.ACTION_BOOT_COMPLETED.equals(action)) {
+        if (Intent.ACTION_BOOT_COMPLETED.equals(action)
+                || Intent.ACTION_MY_PACKAGE_REPLACED.equals(action)) {
             MonitorAlarmUtil.scheduleAlarm(context);
+            MonitorAlarmUtil.scheduleWatchdog(context);
+            WatchdogJobService.schedule(context);
             ContextCompat.startForegroundService(context,
                     new Intent(context, UsageMonitorService.class));
         }
