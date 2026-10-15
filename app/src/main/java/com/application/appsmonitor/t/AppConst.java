@@ -35,6 +35,13 @@ public final class AppConst {
     // 每分钟精确唤醒闹钟的 action（由系统 AlarmManager 触发，应用退后台/被杀也能弹提醒）
     public static final String MONITOR_ALARM_ACTION = "MONITOR_ALARM_RECEIVER";
 
+    // ===== Watchdog 看门狗（独立于主闹钟链的保活机制）=====
+    // 看门狗闹钟 action，每 5 分钟触发一次，检查主服务是否存活
+    public static final String WATCHDOG_ALARM_ACTION = "WATCHDOG_ALARM_RECEIVER";
+    public static final long WATCHDOG_INTERVAL_MS = 5 * 60 * 1000L;
+    // JobScheduler 周期任务 ID
+    public static final int WATCHDOG_JOB_ID = 9527;
+
     // ===== 超上限自动断网（通过 TP-LINK TL-WDR7650 路由后台 API 拉黑设备）=====
     // 命中条件：当日已用分钟数 > MONITOR_DAILY_LIMIT_MIN（即“剩余 < 0”）
     // 开启后，App 会自动 POST 路由器登录接口取 stok，再调 hosts_info.set_block_flag 拉黑目标 MAC。
