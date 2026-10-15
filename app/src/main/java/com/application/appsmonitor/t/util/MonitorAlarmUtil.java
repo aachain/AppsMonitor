@@ -8,6 +8,7 @@ import android.os.Build;
 
 import com.application.appsmonitor.t.AppConst;
 import com.application.appsmonitor.t.receiver.MonitorAlarmReceiver;
+import com.application.appsmonitor.t.receiver.WatchdogAlarmReceiver;
 
 /**
  * MonitorAlarmUtil
@@ -57,6 +58,46 @@ public final class MonitorAlarmUtil {
             flags |= PendingIntent.FLAG_IMMUTABLE;
         }
         PendingIntent pi = PendingIntent.getBroadcast(ctx, 0, i, flags);
+        am.cancel(pi);
+    }
+
+    // ===== Watchdog 看门狗闹钟（独立于主闹钟链，每 5 分钟检查主服务存活）=====
+
+    public static void scheduleWatchdog(Context ctx) {
+        AlarmManager am = (AlarmManager) ctx.getSystemService(Context.ALARM_SERVICE);
+        if (am == null) return;
+        Intent i = new Intent(ctx, WatchdogAlarmReceiver.class);
+        i.setAction(AppConst.WATCHDOG_ALARM_ACTION);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        // 使用不同的 requestCode=1 避免与主闹钟冲突
+        PendingIntent pi = PendingIntent.getBroadcast(ctx, 1, i, flags);
+        long next = System.currentTimeMillis() + AppConst.WATCHDOG_INTERVAL_MS;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, next, pi);
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                am.setExact(AlarmManager.RTC_WAKEUP, next, pi);
+            } else {
+                am.set(AlarmManager.RTC_WAKEUP, next, pi);
+            }
+        } catch (SecurityException e) {
+            am.set(AlarmManager.RTC_WAKEUP, next, pi);
+        }
+    }
+
+    public static void cancelWatchdog(Context ctx) {
+        AlarmManager am = (AlarmManager) ctx.getSystemService(Context.ALARM_SERVICE);
+        if (am == null) return;
+        Intent i = new Intent(ctx, WatchdogAlarmReceiver.class);
+        i.setAction(AppConst.WATCHDOG_ALARM_ACTION);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        PendingIntent pi = PendingIntent.getBroadcast(ctx, 1, i, flags);
         am.cancel(pi);
     }
 }
