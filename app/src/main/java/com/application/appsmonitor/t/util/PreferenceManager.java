@@ -39,20 +39,20 @@ public class PreferenceManager {
         mShare.edit().putInt(key, value).apply();
     }
 
-    public void putLong(String key, long value) {
-        mShare.edit().putLong(key, value).apply();
-    }
-
-    public long getLong(String key, long def) {
-        return mShare.getLong(key, def);
-    }
-
     public boolean getBoolean(String key) {
         return mShare.getBoolean(key, false);
     }
 
     public int getInt(String key) {
         return mShare.getInt(key, 0);
+    }
+
+    public void putLong(String key, long value) {
+        mShare.edit().putLong(key, value).apply();
+    }
+
+    public long getLong(String key) {
+        return mShare.getLong(key, 0L);
     }
 
     public boolean getUninstallSettings(String key) {
