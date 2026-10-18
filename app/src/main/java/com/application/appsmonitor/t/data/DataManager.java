@@ -25,12 +25,9 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 
 import com.application.appsmonitor.t.AppConst;
 import com.application.appsmonitor.t.db.DbIgnoreExecutor;
@@ -48,24 +45,10 @@ import static android.content.Intent.FLAG_ACTIVITY_NEW_TASK;
 public class DataManager {
 
     private static final String TAG = "DataManager";
-    // UsageEvents.Event 在 API 29 后语义重命名但常量值不变：
-    //   ACTIVITY_RESUMED(1) == MOVE_TO_FOREGROUND(1)
-    //   ACTIVITY_PAUSED(2)  == MOVE_TO_BACKGROUND(2)
-    //   ACTIVITY_STOPPED(23) —— API 29 起新增；HyperOS/MIUI 与平板多窗口场景常只发 23 不发 2
+    // 详情页合成会话复用前台(1)/后台(2)事件类型常量，保持与 DetailActivity 渲染一致。
+    // 时长统计已改为直接采用系统 bucket（queryUsageStats），不再自行做事件配对。
     private static final int EVENT_START = UsageEvents.Event.MOVE_TO_FOREGROUND;
     private static final int EVENT_END_PAUSED = UsageEvents.Event.MOVE_TO_BACKGROUND;
-    private static final int EVENT_END_STOPPED = 23;
-    // 屏幕事件（全局、无包名）：熄屏作为“用户真正离开”的会话结束信号。
-    // SCREEN_INTERACTIVE(26)/SCREEN_NON_INTERACTIVE(27) 自 API 21 起提供，minSdk22 可用。
-    private static final int EVENT_SCREEN_ON = UsageEvents.Event.SCREEN_INTERACTIVE;
-    private static final int EVENT_SCREEN_OFF = UsageEvents.Event.SCREEN_NON_INTERACTIVE;
-    // 单个会话合理上限（4 小时）：HyperOS 漏发 END 时 open session 会被补结算到
-    // range[1]；若无上限会把“忘记关的前台应用”膨胀成整天数据。
-    private static final long MAX_SESSION_MS = 4L * 3600L * 1000L;
-    // 一个应用不可能在没有重新进入前台（START）的情况下“第二次退到后台”，
-    // 因此用“本事件流内是否已见过该包 START”作为确定性判据，识别并丢弃重复 END，
-    // 取代不可靠的时间窗口去重（PAUSED/STOPPED 双发、以及包切换 cascade 结算后
-    // 延迟到达的后台事件都可能是重复 END）
 
     private static DataManager mInstance;
 
@@ -82,11 +65,10 @@ public class DataManager {
      * 用于实时监控服务轮询判断是否达到提醒档位。
      * 未授予使用情况访问权限时返回 0（不会产生误报）。
      *
-     * 关键：必须用 queryEvents 配对，并把“当前仍在前台、尚未结算的 open session”
-     * 补算到 now——因为 queryUsageStats().getTotalTimeInForeground() 只统计“已经
-     * 结束的前后台会话”，正在运行的 App 那一段根本不计入。若沿用 queryUsageStats，
-     * 就会出现“正开着被监控 App 时读数一直是 0、永远够不到提醒档位”的问题。
-     * 仅当整个事件流对该包一条事件都没有时（个别 HyperOS 机型行为），才退回 queryUsageStats 兜底。
+     * 口径：直接采用系统 UsageStatsService 自己聚合好的 bucket（queryUsageStats 的
+     * totalTimeInForeground），不再自行用 queryEvents 配对统计。
+     * 已知局限：totalTimeInForeground 只累计“已结束的前后台会话”，当前仍在前台未退出的
+     * 那一段不计入，故实时监控会滞后一个会话。
      */
     public long getTodayUsageMillis(Context context, String pkg) {
         if (TextUtils.isEmpty(pkg)) return 0;
@@ -95,80 +77,21 @@ public class DataManager {
         if (manager == null) return 0;
         long[] range = AppUtil.getTimeRange(SortEnum.TODAY);
         long total = 0;
-        long openStart = 0;   // >0 表示目标包会话进行中（已 START 未熄屏）
-        boolean seen = false; // 本流是否已为目标包起过会话（含跨零点半开兜底）
-        int eventCount = 0;
         try {
-            UsageEvents events = manager.queryEvents(range[0], range[1]);
-            if (events != null) {
-                UsageEvents.Event event = new UsageEvents.Event();
-                while (events.hasNextEvent()) {
-                    events.getNextEvent(event);
-                    int type = event.getEventType();
-                    long t = event.getTimeStamp();
-                    // 熄屏（全局事件，无包名）：结束当前会话——这是“用户真正离开”的信号
-                    if (type == EVENT_SCREEN_OFF) {
-                        if (openStart > 0) {
-                            long dur = t - openStart;
-                            if (dur < 0) dur = 0;
-                            if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
-                            total += dur;
-                            openStart = 0;
-                            seen = false; // 熄屏后允许重新起会话
-                        }
-                        continue;
-                    }
-                    if (type == EVENT_SCREEN_ON) continue;
-                    if (!pkg.equals(event.getPackageName())) continue;
-                    eventCount++;
-                    if (type == EVENT_START) {
-                        // 只要没熄屏就只有一个进行中会话：已 open 时忽略重复 START（活动切换/闪屏）
-                        if (openStart == 0) {
-                            seen = true;
-                            openStart = t;
-                        }
-                    } else if (type == EVENT_END_PAUSED || type == EVENT_END_STOPPED) {
-                        // 退后台不结束会话（口径：启动了没退出就一直计时）；
-                        // 仅跨零点半开（本流未起过会话）时用 range[0] 兜起点
-                        if (openStart == 0 && !seen) {
-                            seen = true;
-                            openStart = range[0];
-                        }
+            List<UsageStats> stats = manager.queryUsageStats(
+                    UsageStatsManager.INTERVAL_DAILY, range[0], range[1]);
+            if (stats != null) {
+                for (UsageStats s : stats) {
+                    if (s != null && pkg.equals(s.getPackageName())) {
+                        total += s.getTotalTimeInForeground();
                     }
                 }
-            }
-            // 边界收尾：查询结束仍未熄屏，结算到 now
-            if (openStart > 0 && range[1] > openStart) {
-                long dur = range[1] - openStart;
-                if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
-                total += dur;
             }
         } catch (Exception e) {
-            Log.e(TAG, "getTodayUsageMillis events error: " + e.getMessage(), e);
-        }
-        // 事件流对该包一条都没有时，退回 queryUsageStats 汇总（不含进行中会话，但聊胜于无）
-        if (eventCount == 0) {
-            long fallback = 0;
-            try {
-                List<UsageStats> stats = manager.queryUsageStats(
-                        UsageStatsManager.INTERVAL_DAILY, range[0], range[1]);
-                if (stats != null) {
-                    for (UsageStats s : stats) {
-                        if (s != null && pkg.equals(s.getPackageName())) {
-                            fallback += s.getTotalTimeInForeground();
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "getTodayUsageMillis fallback error: " + e.getMessage(), e);
-            }
-            Log.w(TAG, "getTodayUsageMillis events empty for " + pkg
-                    + ", fallback queryUsageStats=" + (fallback / 1000) + "s");
-            total = fallback;
+            Log.e(TAG, "getTodayUsageMillis queryUsageStats error: " + e.getMessage(), e);
         }
         if (total < 0) total = 0;
-        Log.d(TAG, "getTodayUsageMillis " + pkg + " events=" + eventCount
-                + " total=" + (total / 1000) + "s");
+        Log.d(TAG, "getTodayUsageMillis " + pkg + " bucket total=" + (total / 1000) + "s");
         return total;
     }
 
@@ -225,68 +148,9 @@ public class DataManager {
         template.mPackageName = target;
         template.mName = AppUtil.parsePackageName(context.getPackageManager(), target);
 
-        int totalEvents = 0;
-        int pairedSessions = 0;
-        UsageEvents events = manager.queryEvents(range[0], range[1]);
-        if (events != null) {
-            long start = 0;   // >0 目标包会话进行中（已 START 未熄屏）
-            boolean seen = false; // 本流是否已为目标包起过会话（含跨零点半开兜底）
-            UsageEvents.Event event = new UsageEvents.Event();
-            while (events.hasNextEvent()) {
-                events.getNextEvent(event);
-                totalEvents++;
-                int type = event.getEventType();
-                long t = event.getTimeStamp();
-                // 熄屏：结束当前会话（用户真正离开的信号）
-                if (type == EVENT_SCREEN_OFF) {
-                    if (start > 0) {
-                        addTimelineEnd(template, items, start, t);
-                        pairedSessions++;
-                        start = 0;
-                        seen = false;
-                    }
-                    continue;
-                }
-                if (type == EVENT_SCREEN_ON) continue;
-                if (!target.equals(event.getPackageName())) continue;
-                if (type == EVENT_START) {
-                    if (start == 0) {
-                        seen = true;
-                        start = t;
-                        AppItem fg = template.copy();
-                        fg.mEventTime = t;
-                        fg.mEventType = EVENT_START;
-                        fg.mUsageTime = 0;
-                        items.add(fg);
-                    }
-                } else if (type == EVENT_END_PAUSED || type == EVENT_END_STOPPED) {
-                    // 退后台不结束会话；仅跨零点半开（本流未起过会话）时用 range[0] 兜起点
-                    if (start == 0 && !seen) {
-                        seen = true;
-                        start = range[0];
-                        AppItem fg = template.copy();
-                        fg.mEventTime = start;
-                        fg.mEventType = EVENT_START;
-                        fg.mUsageTime = 0;
-                        items.add(fg);
-                    }
-                }
-            }
-            // 边界收尾：查询结束仍未熄屏，结算到 range[1]
-            if (start > 0 && range[1] > start) {
-                addTimelineEnd(template, items, start, range[1]);
-                pairedSessions++;
-                start = 0;
-            }
-        } else {
-            Log.w(TAG, "queryEvents returned null for target " + target);
-        }
-        // HyperOS/MIUI 兜底：无有效事件对时，用 queryUsageStats 合成一条会话，避免详情页空白
-        if (pairedSessions == 0) {
-            Log.w(TAG, "Timeline for " + target + " empty (events=" + totalEvents
-                    + "); falling back to queryUsageStats");
-            appendTargetFromUsageStats(manager, target, range, template, items);
-        }
+        // 直接采用系统 bucket（queryUsageStats 的 totalTimeInForeground）合成一条会话，
+        // 不再自行用 queryEvents 配对。系统 bucket 无逐次开关时间线，故详情页展示为一段。
+        appendTargetFromUsageStats(manager, target, range, template, items);
         return items;
     }
 
@@ -299,69 +163,10 @@ public class DataManager {
         if (manager != null) {
             Log.d(TAG, "Querying events from " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[0]))
                     + " to " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[1])));
-            // 会话起点：目标包 START；结束：熄屏(SCREEN_NON_INTERACTIVE)或查询边界。
-            // 退后台(PAUSED/STOPPED)不结束会话——口径为“启动了没退出就一直计时”。
-            Map<String, Long> startPoints = new HashMap<>();
-            // 本事件流内已为该包起过会话（含跨 range[0] 半开兜底）的包，避免重复 START/半开
-            Set<String> seenPkgs = new HashSet<>();
+            // 直接采用系统 UsageStatsService 聚合好的 bucket（queryUsageStats 的
+            // totalTimeInForeground）按包汇总，不再自行用 queryEvents 配对统计。
             Map<String, AppItem> itemsByPkg = new HashMap<>();
-            int totalEvents = 0;
-            int pairedSessions = 0;
-            UsageEvents events = manager.queryEvents(range[0], range[1]);
-            if (events == null) {
-                Log.w(TAG, "queryEvents returned null for range: " + range[0] + " ~ " + range[1]);
-            } else {
-                UsageEvents.Event event = new UsageEvents.Event();
-                while (events.hasNextEvent()) {
-                    events.getNextEvent(event);
-                    totalEvents++;
-                    int eventType = event.getEventType();
-                    long eventTime = event.getTimeStamp();
-                    String eventPackage = event.getPackageName();
-                    // 熄屏（全局事件，无包名）：结束所有仍在进行的会话——“用户真正离开”信号
-                    if (eventType == EVENT_SCREEN_OFF) {
-                        Iterator<Map.Entry<String, Long>> it = startPoints.entrySet().iterator();
-                        while (it.hasNext()) {
-                            Map.Entry<String, Long> se = it.next();
-                            settleAppSession(itemsByPkg, se.getKey(), se.getValue(), eventTime);
-                            pairedSessions++;
-                        }
-                        startPoints.clear();
-                        seenPkgs.clear(); // 熄屏后允许重新起会话
-                        continue;
-                    }
-                    if (eventType == EVENT_SCREEN_ON) continue;
-                    if (TextUtils.isEmpty(eventPackage)) continue;
-                    if (eventType == EVENT_START) {
-                        // 只要没熄屏就只有一个进行中会话：已 open 时忽略重复 START（活动切换/闪屏）
-                        if (!startPoints.containsKey(eventPackage)) {
-                            startPoints.put(eventPackage, eventTime);
-                            seenPkgs.add(eventPackage);
-                            ensureAppItem(items, itemsByPkg, eventPackage);
-                        }
-                    } else if (eventType == EVENT_END_PAUSED || eventType == EVENT_END_STOPPED) {
-                        // 退后台不结束会话；仅跨 range[0] 的半开（本流未起过会话）用 range[0] 兜起点
-                        if (!startPoints.containsKey(eventPackage) && !seenPkgs.contains(eventPackage)) {
-                            startPoints.put(eventPackage, range[0]);
-                            seenPkgs.add(eventPackage);
-                            ensureAppItem(items, itemsByPkg, eventPackage);
-                        }
-                    }
-                }
-                // 边界收尾：查询结束仍未熄屏的会话结算到 range[1]（now）
-                Iterator<Map.Entry<String, Long>> sit = startPoints.entrySet().iterator();
-                while (sit.hasNext()) {
-                    Map.Entry<String, Long> entry = sit.next();
-                    settleAppSession(itemsByPkg, entry.getKey(), entry.getValue(), range[1]);
-                    pairedSessions++;
-                }
-            }
-            // HyperOS/MIUI 兜底：queryEvents 拿不到任何有效会话时，改用 queryUsageStats
-            if (pairedSessions == 0) {
-                Log.w(TAG, "queryEvents produced no sessions (totalEvents=" + totalEvents
-                        + "); falling back to queryUsageStats for HyperOS/MIUI compatibility");
-                appendFromUsageStats(manager, range, items, itemsByPkg);
-            }
+            appendFromUsageStats(manager, range, items, itemsByPkg);
         } else {
             Log.e(TAG, "UsageStatsManager is null");
         }
@@ -468,43 +273,6 @@ public class DataManager {
         return result;
     }
 
-    /**
-     * 详情页：补一条“会话结束(┗)”行，时长 = 结束时刻 - 起始时刻，受 MAX_SESSION_MS 上限。
-     */
-    private void addTimelineEnd(AppItem template, List<AppItem> items, long start, long end) {
-        AppItem bg = template.copy();
-        bg.mEventTime = end;
-        bg.mEventType = EVENT_END_PAUSED; // DetailActivity 据此渲染 ┗ 与时长行
-        long dur = end - start;
-        if (dur < 0) dur = 0;
-        if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
-        bg.mUsageTime = dur;
-        if (bg.mUsageTime > AppConst.USAGE_TIME_MIX) bg.mCount = 1;
-        items.add(bg);
-    }
-
-    private void ensureAppItem(List<AppItem> items, Map<String, AppItem> itemsByPkg, String pkg) {
-        if (itemsByPkg.containsKey(pkg)) return;
-        AppItem item = new AppItem();
-        item.mPackageName = pkg;
-        itemsByPkg.put(pkg, item);
-        items.add(item);
-    }
-
-    /**
-     * 结算一段会话：时长 = 结束 - 起始（受 MAX_SESSION_MS 上限），累加到该包。
-     */
-    private void settleAppSession(Map<String, AppItem> itemsByPkg, String pkg, long start, long end) {
-        AppItem item = itemsByPkg.get(pkg);
-        if (item == null) return;
-        long dur = end - start;
-        if (dur <= 0) return;
-        if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
-        item.mEventTime = end;
-        item.mUsageTime += dur;
-        if (dur > AppConst.USAGE_TIME_MIX) item.mCount++;
-    }
-
     private AppItem containItem(List<AppItem> items, String packageName) {
         for (AppItem item : items) {
             if (item.mPackageName.equals(packageName)) return item;
@@ -520,7 +288,7 @@ public class DataManager {
     }
 
     /**
-     * HyperOS/MIUI 兜底：queryEvents 未产出任何有效会话时，用 queryUsageStats 的
+     * 系统 bucket 统计（主路径）：用 queryUsageStats 的
      * totalTimeInForeground 汇总每包使用情况。手动按包聚合，避免同一包多 bucket 重复。
      * 注意：UsageStats 拿不到精确事件次数，这里给 duration>阈值 的应用粗略 +1 让 count 不为 0。
      */
@@ -572,7 +340,7 @@ public class DataManager {
     }
 
     /**
-     * 详情页时间线的 HyperOS/MIUI 单包兜底：合成一条 "fg + bg" 会话，
+     * 详情页时间线（主路径，基于系统 bucket）：合成一条 "fg + bg" 会话，
      * 时间基于 UsageStats.lastTimeUsed 与 totalTimeInForeground 反推。
      */
     private void appendTargetFromUsageStats(UsageStatsManager usm, String target,
