@@ -39,6 +39,14 @@ public class PreferenceManager {
         mShare.edit().putInt(key, value).apply();
     }
 
+    public void putLong(String key, long value) {
+        mShare.edit().putLong(key, value).apply();
+    }
+
+    public long getLong(String key, long def) {
+        return mShare.getLong(key, def);
+    }
+
     public boolean getBoolean(String key) {
         return mShare.getBoolean(key, false);
     }
