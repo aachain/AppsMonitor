@@ -1,19 +1,18 @@
 package com.application.appsmonitor.t.data;
 
 import android.Manifest;
-import android.app.ActivityManager;
 import android.app.AppOpsManager;
 import android.app.usage.NetworkStats;
 import android.app.usage.NetworkStatsManager;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStats;
 import android.app.usage.UsageStatsManager;
-import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.ConnectivityManager;
 import android.os.Build;
+import android.os.PowerManager;
 import android.os.RemoteException;
 import android.provider.Settings;
 import androidx.core.app.ActivityCompat;
@@ -27,9 +26,12 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 import com.application.appsmonitor.t.AppConst;
 import com.application.appsmonitor.t.db.DbIgnoreExecutor;
@@ -47,17 +49,20 @@ import static android.content.Intent.FLAG_ACTIVITY_NEW_TASK;
 public class DataManager {
 
     private static final String TAG = "DataManager";
-    // 详情页合成会话复用前台(1)/后台(2)事件类型常量，保持与 DetailActivity 渲染一致。
+    // UsageEvents.Event 在 API 29 后语义重命名但常量值不变：
+    //   ACTIVITY_RESUMED(1) == MOVE_TO_FOREGROUND(1)
+    //   ACTIVITY_PAUSED(2)  == MOVE_TO_BACKGROUND(2)
+    //   ACTIVITY_STOPPED(23) —— API 29 起新增；HyperOS/MIUI 与平板多窗口场景常只发 23 不发 2
     private static final int EVENT_START = UsageEvents.Event.MOVE_TO_FOREGROUND;
     private static final int EVENT_END_PAUSED = UsageEvents.Event.MOVE_TO_BACKGROUND;
-
-    // ===== 方案A 心跳计数持久化键 =====
-    // 上一次心跳 tick 的时间戳（全局，用于计算经过时间 delta）
-    private static final String PREF_HB_TICK = "hb_tick";
-    // 最近一次观测到的前台包（全局持久化，游戏静默空窗靠它延续）
-    private static final String PREF_HB_FG = "hb_fg";
-    // 按天+包累计的心跳前台时长前缀，完整键为 hbms_yyyyMMdd_包名
-    private static final String HB_TOTAL_PREFIX = "hbms_";
+    private static final int EVENT_END_STOPPED = 23;
+    // 单个会话合理上限（4 小时）：HyperOS 漏发 END 时 open session 会被补结算到
+    // range[1]；若无上限会把“忘记关的前台应用”膨胀成整天数据。
+    private static final long MAX_SESSION_MS = 4L * 3600L * 1000L;
+    // 一个应用不可能在没有重新进入前台（START）的情况下“第二次退到后台”，
+    // 因此用“本事件流内是否已见过该包 START”作为确定性判据，识别并丢弃重复 END，
+    // 取代不可靠的时间窗口去重（PAUSED/STOPPED 双发、以及包切换 cascade 结算后
+    // 延迟到达的后台事件都可能是重复 END）
 
     private static DataManager mInstance;
 
@@ -74,157 +79,134 @@ public class DataManager {
      * 用于实时监控服务轮询判断是否达到提醒档位。
      * 未授予使用情况访问权限时返回 0（不会产生误报）。
      *
-     * 口径（方案A）：主统计源为前台轮询心跳计数（{@link #heartbeatTick}），
-     * 系统 bucket（queryUsageStats 的 totalTimeInForeground）降为兜底，
-     * 取二者最大值：游戏场景心跳远大于 bucket（bucket 漏记），常规场景 bucket
-     * 可补齐心跳因服务被杀而漏掉的已结束会话。
+     * 关键：必须用 queryEvents 配对，并把“当前仍在前台、尚未结算的 open session”
+     * 补算到 now——因为 queryUsageStats().getTotalTimeInForeground() 只统计“已经
+     * 结束的前后台会话”，正在运行的 App 那一段根本不计入。若沿用 queryUsageStats，
+     * 就会出现“正开着被监控 App 时读数一直是 0、永远够不到提醒档位”的问题。
+     * 仅当整个事件流对该包一条事件都没有时（个别 HyperOS 机型行为），才退回 queryUsageStats 兜底。
      */
     public long getTodayUsageMillis(Context context, String pkg) {
-        if (TextUtils.isEmpty(pkg)) return 0;
-        long hb = heartbeatTodayMillis(pkg);
-        long bucket = bucketTodayMillis(context, pkg);
-        long result = Math.max(hb, bucket);
-        Log.d(TAG, "getTodayUsageMillis " + pkg + " hb=" + (hb / 1000) + "s bucket="
-                + (bucket / 1000) + "s -> " + (result / 1000) + "s");
-        return result;
-    }
-
-    /** 系统 bucket 当日前台时长（兜底路径），未授权或异常返回 0。 */
-    private long bucketTodayMillis(Context context, String pkg) {
         if (TextUtils.isEmpty(pkg)) return 0;
         if (!hasPermission(context)) return 0;
         UsageStatsManager manager = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
         if (manager == null) return 0;
         long[] range = AppUtil.getTimeRange(SortEnum.TODAY);
         long total = 0;
+        long openStart = 0;
+        boolean seen = false;
+        int eventCount = 0;
         try {
-            List<UsageStats> stats = manager.queryUsageStats(
-                    UsageStatsManager.INTERVAL_DAILY, range[0], range[1]);
-            if (stats != null) {
-                for (UsageStats s : stats) {
-                    if (s != null && pkg.equals(s.getPackageName())) {
-                        total += s.getTotalTimeInForeground();
+            UsageEvents events = manager.queryEvents(range[0], range[1]);
+            if (events != null) {
+                UsageEvents.Event event = new UsageEvents.Event();
+                while (events.hasNextEvent()) {
+                    events.getNextEvent(event);
+                    if (!pkg.equals(event.getPackageName())) continue;
+                    eventCount++;
+                    int type = event.getEventType();
+                    long t = event.getTimeStamp();
+                    if (type == EVENT_START) {
+                        // 只跟踪一个进行中的会话：已 open 时忽略重复 START
+                        if (openStart == 0) {
+                            seen = true;
+                            openStart = t;
+                        }
+                    } else if (type == EVENT_END_PAUSED || type == EVENT_END_STOPPED) {
+                        if (openStart == 0) {
+                            // 找不到配对 START：本流已见过 START → 是同一次退出的重复 END（PAUSED/STOPPED 双发），跳过
+                            if (seen) continue;
+                            // 本流从未出现 START 的 END：跨零点半开会话，用 range[0] 兜住起点
+                            seen = true;
+                            openStart = range[0];
+                        }
+                        long dur = t - openStart;
+                        if (dur < 0) dur = 0;
+                        if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
+                        total += dur;
+                        openStart = 0;
                     }
                 }
             }
+            // 结算仍在前台的当前会话（这正是 queryUsageStats 读不到的那一段）
+            if (openStart > 0 && range[1] > openStart) {
+                long dur = range[1] - openStart;
+                if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
+                total += dur;
+            }
         } catch (Exception e) {
-            Log.e(TAG, "bucketTodayMillis error: " + e.getMessage(), e);
+            Log.e(TAG, "getTodayUsageMillis events error: " + e.getMessage(), e);
+        }
+        // 事件流对该包一条都没有时，退回 queryUsageStats 汇总（不含进行中会话，但聊胜于无）
+        if (eventCount == 0) {
+            long fallback = 0;
+            try {
+                List<UsageStats> stats = manager.queryUsageStats(
+                        UsageStatsManager.INTERVAL_DAILY, range[0], range[1]);
+                if (stats != null) {
+                    for (UsageStats s : stats) {
+                        if (s != null && pkg.equals(s.getPackageName())) {
+                            fallback += s.getTotalTimeInForeground();
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "getTodayUsageMillis fallback error: " + e.getMessage(), e);
+            }
+            Log.w(TAG, "getTodayUsageMillis events empty for " + pkg
+                    + ", fallback queryUsageStats=" + (fallback / 1000) + "s");
+            total = fallback;
         }
         if (total < 0) total = 0;
+        Log.d(TAG, "getTodayUsageMillis " + pkg + " events=" + eventCount
+                + " total=" + (total / 1000) + "s");
         return total;
     }
 
-    /** 读取指定包今日心跳累计（毫秒）。 */
-    public long heartbeatTodayMillis(String pkg) {
-        if (TextUtils.isEmpty(pkg)) return 0;
-        String today = new SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(new Date());
-        return PreferenceManager.getInstance().getLong(HB_TOTAL_PREFIX + today + "_" + pkg, 0L);
+    /**
+     * 屏幕当前是否点亮且可交互（熄屏/锁屏返回 false）。
+     * 用于心跳计时：只有亮屏时才可能计入前台时长。
+     */
+    public boolean isScreenInteractive(Context context) {
+        PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        return pm != null && pm.isInteractive();
     }
 
     /**
-     * 心跳一次 tick：由前台服务的轮询/闹钟链驱动（见 UsageMonitorService.checkAll）。
-     * 计算距上次 tick 的经过时间 delta（封顶 HB_MAX_TICK_MS，跨天/首次为 0），
-     * 屏幕熄灭时不累加（视为用户离开），否则探测当前前台包并把 delta 累加到其当日计数。
+     * 判定当前处于前台的应用包名。
+     * 思路：回看最近 windowMs 内的“进入前台（EVENT_START / ACTIVITY_RESUMED）”事件，
+     * 取时间戳最晚的一条作为当前前台包；若窗口内没有任何新事件，说明这段时间
+     * 未发生前后台切换，则沿用上一次观测到的前台包（持久化在 SharedPreferences）。
+     * 返回 null 表示无法判定（无权限 / 从未观测到）。
      */
-    public void heartbeatTick(Context context) {
-        long now = System.currentTimeMillis();
-        PreferenceManager pm = PreferenceManager.getInstance();
-        long last = pm.getLong(PREF_HB_TICK, 0L);
-        long delta = 0L;
-        if (last > 0L && isSameDay(last, now)) {
-            delta = now - last;
-            if (delta > AppConst.HB_MAX_TICK_MS) delta = AppConst.HB_MAX_TICK_MS;
-            if (delta < 0L) delta = 0L;
-        }
-        pm.putLong(PREF_HB_TICK, now);
-        // 首次/跨天/无间隔：仅建立基线，不累加
-        if (delta <= 0L) return;
-        // 熄屏视为离开，不计时（延续既有“熄灭即结束会话”口径）
-        if (!isScreenInteractive(context)) return;
-        String fg = detectForegroundPackage(context, now);
-        if (TextUtils.isEmpty(fg) || fg.equals(context.getPackageName())) return;
-        String today = new SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(new Date(now));
-        String key = HB_TOTAL_PREFIX + today + "_" + fg;
-        long acc = pm.getLong(key, 0L) + delta;
-        pm.putLong(key, acc);
-        Log.d(TAG, "heartbeatTick fg=" + fg + " +" + (delta / 1000) + "s acc=" + (acc / 1000) + "s");
-    }
-
-    /**
-     * 探测“当前前台包”。两层信号：
-     * 1) ActivityManager.getRunningTasks(1)：MIUI/HyperOS 对持 usage-access 的 App
-     *    常不强制 AOSP 限制，能拿到真实顶层任务；返回自身包名视为不可用，转下层。
-     * 2) queryEvents 回看窗口内最后一条 RESUMED 的包；若窗口内无任何事件（游戏静默
-     *    空窗）则沿用持久化的 last-known 前台包——真实离开必触发他包 RESUMED 覆盖它，
-     *    故“无新事件 = 前台未变”成立。
-     */
-    private String detectForegroundPackage(Context context, long now) {
-        String own = context.getPackageName();
-        // 层一：getRunningTasks
-        try {
-            ActivityManager am = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
-            if (am != null) {
-                List<ActivityManager.RunningTaskInfo> tasks = am.getRunningTasks(1);
-                if (tasks != null && !tasks.isEmpty()) {
-                    ComponentName top = tasks.get(0).topActivity;
-                    if (top != null) {
-                        String p = top.getPackageName();
-                        if (!TextUtils.isEmpty(p) && !p.equals(own)) {
-                            PreferenceManager.getInstance().putString(PREF_HB_FG, p);
-                            return p;
-                        }
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            // 部分 ROM 限制/异常，落到层二
-        }
-        // 层二：queryEvents 回看窗口内最后一条 RESUMED
-        String lastKnown = PreferenceManager.getInstance().getString(PREF_HB_FG);
+    public String getForegroundPackage(Context context, long windowMs) {
         UsageStatsManager manager = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
-        if (manager != null) {
-            try {
-                long from = now - AppConst.HB_FG_LOOKBACK_MS;
-                UsageEvents events = manager.queryEvents(from, now);
-                if (events != null) {
-                    UsageEvents.Event e = new UsageEvents.Event();
-                    String seen = null;
-                    while (events.hasNextEvent()) {
-                        events.getNextEvent(e);
-                        if (e.getEventType() == EVENT_START && !TextUtils.isEmpty(e.getPackageName())) {
-                            seen = e.getPackageName();
-                        }
-                    }
-                    if (!TextUtils.isEmpty(seen) && !seen.equals(own)) {
-                        lastKnown = seen;
-                        PreferenceManager.getInstance().putString(PREF_HB_FG, seen);
+        if (manager == null) return null;
+        long now = System.currentTimeMillis();
+        String result = null;
+        try {
+            UsageEvents events = manager.queryEvents(now - windowMs, now);
+            if (events != null) {
+                long bestTs = 0;
+                UsageEvents.Event e = new UsageEvents.Event();
+                while (events.hasNextEvent()) {
+                    events.getNextEvent(e);
+                    if (e.getEventType() == EVENT_START && e.getTimeStamp() >= bestTs) {
+                        bestTs = e.getTimeStamp();
+                        result = e.getPackageName();
                     }
                 }
-            } catch (Throwable t) {
-                Log.e(TAG, "detectForegroundPackage queryEvents error: " + t.getMessage());
             }
+        } catch (Exception ex) {
+            Log.e(TAG, "getForegroundPackage error: " + ex.getMessage(), ex);
         }
-        if (!TextUtils.isEmpty(lastKnown) && !lastKnown.equals(own)) return lastKnown;
-        return null;
-    }
-
-    private boolean isScreenInteractive(Context context) {
-        try {
-            android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(Context.POWER_SERVICE);
-            if (pm == null) return true;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) {
-                return pm.isInteractive();
-            }
-            return pm.isScreenOn();
-        } catch (Throwable t) {
-            return true;
+        String key = "last_fg_pkg";
+        if (!TextUtils.isEmpty(result)) {
+            PreferenceManager.getInstance().putString(key, result);
+            return result;
         }
-    }
-
-    private boolean isSameDay(long a, long b) {
-        String da = new SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(new Date(a));
-        String db = new SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(new Date(b));
-        return da.equals(db);
+        // 窗口内无新事件：沿用最后一次已知前台包，避免长时间停留同一界面时误判为“不在前台”
+        String saved = PreferenceManager.getInstance().getString(key);
+        return TextUtils.isEmpty(saved) ? null : saved;
     }
 
     public void requestPermission(Context context) {
@@ -280,10 +262,83 @@ public class DataManager {
         template.mPackageName = target;
         template.mName = AppUtil.parsePackageName(context.getPackageManager(), target);
 
-        // 主统计源为心跳、系统 bucket 降为兜底：详情页无逐次时间线，合成一段会话，
-        // 当日时长按 max(心跳, bucket) 取值，与实时监控口径一致。
-        long hbMillis = (offset == SortEnum.TODAY.ordinal()) ? heartbeatTodayMillis(target) : 0L;
-        appendTargetFromUsageStats(manager, target, range, template, items, hbMillis);
+        int totalEvents = 0;
+        int pairedSessions = 0;
+        UsageEvents events = manager.queryEvents(range[0], range[1]);
+        if (events != null) {
+            long start = 0;
+            // 目标 app 是否已在本流内出现 START 或已做过一次半开兑底
+            boolean seen = false;
+            UsageEvents.Event event = new UsageEvents.Event();
+            while (events.hasNextEvent()) {
+                events.getNextEvent(event);
+                totalEvents++;
+                if (!target.equals(event.getPackageName())) continue;
+                int type = event.getEventType();
+                long t = event.getTimeStamp();
+                if (type == EVENT_START) {
+                    if (start == 0) {
+                        seen = true;
+                        start = t;
+                        AppItem fg = template.copy();
+                        fg.mEventTime = t;
+                        fg.mEventType = EVENT_START;
+                        fg.mUsageTime = 0;
+                        items.add(fg);
+                    }
+                } else if (type == EVENT_END_PAUSED || type == EVENT_END_STOPPED) {
+                    // start==0 且已见过 START，却又收到无配对 START 的 END → 同一次退出的
+                    // 重复 END（PAUSED/STOPPED 双发），跳过，否则会当跨零点半开会话用 range[0] 兜出幽灵时长
+                    if (start == 0 && seen) {
+                        continue;
+                    }
+                    // 半开 session：目标 app 的 START 落在 range[0] 之前，用 range[0] 兜住起点
+                    long s = start > 0 ? start : range[0];
+                    if (t > s) {
+                        if (start == 0) {
+                            seen = true;
+                            // 补一条合成的“前台开始”行，保持详情页成对展示
+                            AppItem fg = template.copy();
+                            fg.mEventTime = s;
+                            fg.mEventType = EVENT_START;
+                            fg.mUsageTime = 0;
+                            items.add(fg);
+                        }
+                        AppItem bg = template.copy();
+                        bg.mEventTime = t;
+                        bg.mEventType = EVENT_END_PAUSED; // 保持与 DetailActivity 现有渲染逻辑一致
+                        long dur = t - s;
+                        if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
+                        bg.mUsageTime = dur;
+                        if (bg.mUsageTime > AppConst.USAGE_TIME_MIX) bg.mCount = 1;
+                        items.add(bg);
+                        pairedSessions++;
+                        start = 0;
+                    }
+                }
+            }
+            // 边界收尾：目标应用仍“前台”则用 range[1] 结算；上限 MAX_SESSION_MS
+            // 避免“忘记关的前台应用”把整天数据高估
+            if (start > 0 && range[1] > start) {
+                AppItem bg = template.copy();
+                bg.mEventTime = range[1];
+                bg.mEventType = EVENT_END_PAUSED;
+                long dur = range[1] - start;
+                if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
+                bg.mUsageTime = dur;
+                if (bg.mUsageTime > AppConst.USAGE_TIME_MIX) bg.mCount = 1;
+                items.add(bg);
+                pairedSessions++;
+            }
+        } else {
+            Log.w(TAG, "queryEvents returned null for target " + target);
+        }
+        // HyperOS/MIUI 兜底：无有效事件对时，用 queryUsageStats 合成一条会话，避免详情页空白
+        if (pairedSessions == 0) {
+            Log.w(TAG, "Timeline for " + target + " empty (events=" + totalEvents
+                    + "); falling back to queryUsageStats");
+            appendTargetFromUsageStats(manager, target, range, template, items);
+        }
         return items;
     }
 
@@ -296,11 +351,111 @@ public class DataManager {
         if (manager != null) {
             Log.d(TAG, "Querying events from " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[0]))
                     + " to " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[1])));
-            // 系统 bucket 作兜底按包聚合；主统计源为心跳（仅当日区间可比）。
+            Map<String, Long> startPoints = new HashMap<>();
+            // 本事件流内已出现过 START（或已做过一次半开兑底）的包；
+            // 后续“找不到配对 START”的 END 都是重复事件，必须丢弃
+            Set<String> seenPkgs = new HashSet<>();
             Map<String, AppItem> itemsByPkg = new HashMap<>();
-            appendFromUsageStats(manager, range, items, itemsByPkg);
-            if (offset == SortEnum.TODAY.ordinal()) {
-                applyHeartbeat(items, itemsByPkg);
+            int totalEvents = 0;
+            int pairedSessions = 0;
+            UsageEvents events = manager.queryEvents(range[0], range[1]);
+            if (events == null) {
+                Log.w(TAG, "queryEvents returned null for range: " + range[0] + " ~ " + range[1]);
+            } else {
+                UsageEvents.Event event = new UsageEvents.Event();
+                while (events.hasNextEvent()) {
+                    events.getNextEvent(event);
+                    totalEvents++;
+                    int eventType = event.getEventType();
+                    long eventTime = event.getTimeStamp();
+                    String eventPackage = event.getPackageName();
+                    if (TextUtils.isEmpty(eventPackage)) continue;
+                    if (eventType == EVENT_START) {
+                        // 标记该包本流内已 START；同时作为“重复 END”去重依据
+                        seenPkgs.add(eventPackage);
+                        // HyperOS 平板多窗口常见：新应用 RESUMED 到达但旧应用的 END/PAUSED/STOPPED 漏发。
+                        // 先把除当前 pkg 外仍挂在 startPoints 里的“孤儿会话”用当前时刻隐式结算。
+                        Iterator<Map.Entry<String, Long>> it = startPoints.entrySet().iterator();
+                        while (it.hasNext()) {
+                            Map.Entry<String, Long> oe = it.next();
+                            String orphanPkg = oe.getKey();
+                            if (orphanPkg.equals(eventPackage)) continue;
+                            long orphanStart = oe.getValue();
+                            if (eventTime > orphanStart) {
+                                AppItem oItem = itemsByPkg.get(orphanPkg);
+                                if (oItem != null) {
+                                    long d = eventTime - orphanStart;
+                                    if (d > MAX_SESSION_MS) d = MAX_SESSION_MS;
+                                    oItem.mEventTime = eventTime;
+                                    oItem.mUsageTime += d;
+                                    if (d > AppConst.USAGE_TIME_MIX) oItem.mCount++;
+                                    pairedSessions++;
+                                }
+                                it.remove();
+                            }
+                        }
+                        AppItem item = itemsByPkg.get(eventPackage);
+                        if (item == null) {
+                            item = new AppItem();
+                            item.mPackageName = eventPackage;
+                            itemsByPkg.put(eventPackage, item);
+                            items.add(item);
+                        }
+                        if (!startPoints.containsKey(eventPackage)) {
+                            startPoints.put(eventPackage, eventTime);
+                        }
+                    } else if (eventType == EVENT_END_PAUSED || eventType == EVENT_END_STOPPED) {
+                        Long startObj = startPoints.remove(eventPackage);
+                        if (startObj == null) {
+                            // 没有配对 START：若本流内已见过该包 START，则为重复 END
+                            // （PAUSED/STOPPED 双发，或包切换 cascade 已结算后延迟到达的后台事件），
+                            // 必须跳过，否则会当跨零点半开会话用 range[0] 兜出幽灵时长（如 0:00~2:00）。
+                            if (seenPkgs.contains(eventPackage)) {
+                                continue;
+                            }
+                            // 本流内从未出现 START 的 END：真正跨 range[0] 的半开会话（如昨日 23:00 开启跨过 00:00），
+                            // 标记后用 range[0] 兑底，后续重复 END 会被上面的分支丢弃
+                            seenPkgs.add(eventPackage);
+                        }
+                        // 半开 session：END 落在窗口内但 START 在窗口之前（跨 range[0]），
+                        // 用 range[0] 兜住起点，避免整段使用被丢弃。
+                        long start = startObj != null ? startObj : range[0];
+                        if (eventTime > start) {
+                            AppItem item = itemsByPkg.get(eventPackage);
+                            if (item == null) {
+                                item = new AppItem();
+                                item.mPackageName = eventPackage;
+                                itemsByPkg.put(eventPackage, item);
+                                items.add(item);
+                            }
+                            long duration = eventTime - start;
+                            if (duration > MAX_SESSION_MS) duration = MAX_SESSION_MS;
+                            item.mEventTime = eventTime;
+                            item.mUsageTime += duration;
+                            if (duration > AppConst.USAGE_TIME_MIX) item.mCount++;
+                            pairedSessions++;
+                        }
+                    }
+                }
+                // 边界收尾：查询结束仍在“开始”状态的应用（HyperOS 与平板多窗口常见），
+                // 用 range[1] 结算；上限 MAX_SESSION_MS 避免“忘关的前台应用”高估整天数据
+                for (Map.Entry<String, Long> entry : startPoints.entrySet()) {
+                    AppItem item = itemsByPkg.get(entry.getKey());
+                    if (item == null) continue;
+                    long duration = range[1] - entry.getValue();
+                    if (duration <= 0) continue;
+                    if (duration > MAX_SESSION_MS) duration = MAX_SESSION_MS;
+                    item.mEventTime = range[1];
+                    item.mUsageTime += duration;
+                    if (duration > AppConst.USAGE_TIME_MIX) item.mCount++;
+                    pairedSessions++;
+                }
+            }
+            // HyperOS/MIUI 兜底：queryEvents 拿不到任何有效会话时，改用 queryUsageStats
+            if (pairedSessions == 0) {
+                Log.w(TAG, "queryEvents produced no sessions (totalEvents=" + totalEvents
+                        + "); falling back to queryUsageStats for HyperOS/MIUI compatibility");
+                appendFromUsageStats(manager, range, items, itemsByPkg);
             }
         } else {
             Log.e(TAG, "UsageStatsManager is null");
@@ -378,34 +533,6 @@ public class DataManager {
         return newList;
     }
 
-    /**
-     * 将当日心跳时长合入总列表：对已有包取 max(心跳, bucket)；若某监控包在 bucket
-     * 缺失但心跳有值（如 HyperOS 游戏 bucket 几近 0），补建条目，避免主路径漏显。
-     */
-    private void applyHeartbeat(List<AppItem> items, Map<String, AppItem> itemsByPkg) {
-        for (AppItem item : items) {
-            long hb = heartbeatTodayMillis(item.mPackageName);
-            if (hb > item.mUsageTime) {
-                item.mUsageTime = hb;
-                if (item.mCount <= 0) item.mCount = 1;
-            }
-        }
-        String[] monitored = AppConst.MONITOR_PACKAGES;
-        if (monitored != null) {
-            for (String pkg : monitored) {
-                if (TextUtils.isEmpty(pkg) || itemsByPkg.containsKey(pkg)) continue;
-                long hb = heartbeatTodayMillis(pkg);
-                if (hb <= 0) continue;
-                AppItem item = new AppItem();
-                item.mPackageName = pkg;
-                item.mUsageTime = hb;
-                item.mCount = 1;
-                itemsByPkg.put(pkg, item);
-                items.add(item);
-            }
-        }
-    }
-
     private Map<String, Long> getMobileData(Context context, TelephonyManager tm, NetworkStatsManager nsm, int offset) {
         Map<String, Long> result = new HashMap<>();
         if (ActivityCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
@@ -451,7 +578,7 @@ public class DataManager {
     }
 
     /**
-     * 系统 bucket 统计（主路径）：用 queryUsageStats 的
+     * HyperOS/MIUI 兜底：queryEvents 未产出任何有效会话时，用 queryUsageStats 的
      * totalTimeInForeground 汇总每包使用情况。手动按包聚合，避免同一包多 bucket 重复。
      * 注意：UsageStats 拿不到精确事件次数，这里给 duration>阈值 的应用粗略 +1 让 count 不为 0。
      */
@@ -503,12 +630,12 @@ public class DataManager {
     }
 
     /**
-     * 详情页时间线（基于系统 bucket + 心跳）：合成一条 "fg + bg" 会话，
-     * 时长取 max(bucket, hbMillis)，时间基于 UsageStats.lastTimeUsed 与时长反推。
+     * 详情页时间线的 HyperOS/MIUI 单包兜底：合成一条 "fg + bg" 会话，
+     * 时间基于 UsageStats.lastTimeUsed 与 totalTimeInForeground 反推。
      */
     private void appendTargetFromUsageStats(UsageStatsManager usm, String target,
                                             long[] range, AppItem template,
-                                            List<AppItem> items, long hbMillis) {
+                                            List<AppItem> items) {
         try {
             long dur = 0L;
             long last = 0L;
@@ -521,13 +648,10 @@ public class DataManager {
                     if (us.getLastTimeUsed() > last) last = us.getLastTimeUsed();
                 }
             }
-            // 心跳为主：取更大者作为真实当日时长；last 不可用时以查询边界兜底。
-            if (hbMillis > dur) dur = hbMillis;
-            if (dur <= 0) {
-                Log.w(TAG, "appendTargetFromUsageStats empty for target " + target);
+            if (dur <= 0 || last <= 0) {
+                Log.w(TAG, "queryUsageStats fallback empty for target " + target);
                 return;
             }
-            if (last <= 0) last = range[1];
             long begin = Math.max(range[0], last - dur);
             AppItem fg = template.copy();
             fg.mEventTime = begin;
