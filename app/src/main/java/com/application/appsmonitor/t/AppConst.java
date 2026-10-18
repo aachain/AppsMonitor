@@ -32,6 +32,16 @@ public final class AppConst {
     // public static final int[] MONITOR_TIERS_MIN = {1, 20, 55, 115};
     // 轮询间隔（毫秒）
     public static final long MONITOR_CHECK_INTERVAL_MS = 60 * 1000L;
+
+    // ===== 方案A：前台轮询心跳计数（主统计源，系统 bucket 降为兜底）=====
+    // 每次轮询判断“当前前台包”，给该包按经过时间累加，不依赖目标 App 是否持续
+    // 发 RESUMED 事件——可治 HyperOS 游戏“连续玩 1 小时事件流却整段空窗”的漏记。
+    // 单次 tick 最多补算的间隔（毫秒）：服务被冻结/杀死后恢复时，不把整段空档
+    // 都算成前台，仅按至多 2 个轮询周期补算。
+    public static final long HB_MAX_TICK_MS = 2 * MONITOR_CHECK_INTERVAL_MS;
+    // 解析“当前前台包”时向前查 RESUMED 事件的窗口（毫秒）。窗口内的空窗（游戏静默）
+    // 依赖持久化的 last-known 前台包延续，故无需覆盖整段，5 分钟足以捕捉真实切换。
+    public static final long HB_FG_LOOKBACK_MS = 5 * 60 * 1000L;
     // 每分钟精确唤醒闹钟的 action（由系统 AlarmManager 触发，应用退后台/被杀也能弹提醒）
     public static final String MONITOR_ALARM_ACTION = "MONITOR_ALARM_RECEIVER";
 
