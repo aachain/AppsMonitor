@@ -1,12 +1,14 @@
 package com.application.appsmonitor.t.data;
 
 import android.Manifest;
+import android.app.ActivityManager;
 import android.app.AppOpsManager;
 import android.app.usage.NetworkStats;
 import android.app.usage.NetworkStatsManager;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStats;
 import android.app.usage.UsageStatsManager;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -46,9 +48,16 @@ public class DataManager {
 
     private static final String TAG = "DataManager";
     // 详情页合成会话复用前台(1)/后台(2)事件类型常量，保持与 DetailActivity 渲染一致。
-    // 时长统计已改为直接采用系统 bucket（queryUsageStats），不再自行做事件配对。
     private static final int EVENT_START = UsageEvents.Event.MOVE_TO_FOREGROUND;
     private static final int EVENT_END_PAUSED = UsageEvents.Event.MOVE_TO_BACKGROUND;
+
+    // ===== 方案A 心跳计数持久化键 =====
+    // 上一次心跳 tick 的时间戳（全局，用于计算经过时间 delta）
+    private static final String PREF_HB_TICK = "hb_tick";
+    // 最近一次观测到的前台包（全局持久化，游戏静默空窗靠它延续）
+    private static final String PREF_HB_FG = "hb_fg";
+    // 按天+包累计的心跳前台时长前缀，完整键为 hbms_yyyyMMdd_包名
+    private static final String HB_TOTAL_PREFIX = "hbms_";
 
     private static DataManager mInstance;
 
@@ -65,12 +74,23 @@ public class DataManager {
      * 用于实时监控服务轮询判断是否达到提醒档位。
      * 未授予使用情况访问权限时返回 0（不会产生误报）。
      *
-     * 口径：直接采用系统 UsageStatsService 自己聚合好的 bucket（queryUsageStats 的
-     * totalTimeInForeground），不再自行用 queryEvents 配对统计。
-     * 已知局限：totalTimeInForeground 只累计“已结束的前后台会话”，当前仍在前台未退出的
-     * 那一段不计入，故实时监控会滞后一个会话。
+     * 口径（方案A）：主统计源为前台轮询心跳计数（{@link #heartbeatTick}），
+     * 系统 bucket（queryUsageStats 的 totalTimeInForeground）降为兜底，
+     * 取二者最大值：游戏场景心跳远大于 bucket（bucket 漏记），常规场景 bucket
+     * 可补齐心跳因服务被杀而漏掉的已结束会话。
      */
     public long getTodayUsageMillis(Context context, String pkg) {
+        if (TextUtils.isEmpty(pkg)) return 0;
+        long hb = heartbeatTodayMillis(pkg);
+        long bucket = bucketTodayMillis(context, pkg);
+        long result = Math.max(hb, bucket);
+        Log.d(TAG, "getTodayUsageMillis " + pkg + " hb=" + (hb / 1000) + "s bucket="
+                + (bucket / 1000) + "s -> " + (result / 1000) + "s");
+        return result;
+    }
+
+    /** 系统 bucket 当日前台时长（兜底路径），未授权或异常返回 0。 */
+    private long bucketTodayMillis(Context context, String pkg) {
         if (TextUtils.isEmpty(pkg)) return 0;
         if (!hasPermission(context)) return 0;
         UsageStatsManager manager = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
@@ -88,11 +108,123 @@ public class DataManager {
                 }
             }
         } catch (Exception e) {
-            Log.e(TAG, "getTodayUsageMillis queryUsageStats error: " + e.getMessage(), e);
+            Log.e(TAG, "bucketTodayMillis error: " + e.getMessage(), e);
         }
         if (total < 0) total = 0;
-        Log.d(TAG, "getTodayUsageMillis " + pkg + " bucket total=" + (total / 1000) + "s");
         return total;
+    }
+
+    /** 读取指定包今日心跳累计（毫秒）。 */
+    public long heartbeatTodayMillis(String pkg) {
+        if (TextUtils.isEmpty(pkg)) return 0;
+        String today = new SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(new Date());
+        return PreferenceManager.getInstance().getLong(HB_TOTAL_PREFIX + today + "_" + pkg, 0L);
+    }
+
+    /**
+     * 心跳一次 tick：由前台服务的轮询/闹钟链驱动（见 UsageMonitorService.checkAll）。
+     * 计算距上次 tick 的经过时间 delta（封顶 HB_MAX_TICK_MS，跨天/首次为 0），
+     * 屏幕熄灭时不累加（视为用户离开），否则探测当前前台包并把 delta 累加到其当日计数。
+     */
+    public void heartbeatTick(Context context) {
+        long now = System.currentTimeMillis();
+        PreferenceManager pm = PreferenceManager.getInstance();
+        long last = pm.getLong(PREF_HB_TICK, 0L);
+        long delta = 0L;
+        if (last > 0L && isSameDay(last, now)) {
+            delta = now - last;
+            if (delta > AppConst.HB_MAX_TICK_MS) delta = AppConst.HB_MAX_TICK_MS;
+            if (delta < 0L) delta = 0L;
+        }
+        pm.putLong(PREF_HB_TICK, now);
+        // 首次/跨天/无间隔：仅建立基线，不累加
+        if (delta <= 0L) return;
+        // 熄屏视为离开，不计时（延续既有“熄灭即结束会话”口径）
+        if (!isScreenInteractive(context)) return;
+        String fg = detectForegroundPackage(context, now);
+        if (TextUtils.isEmpty(fg) || fg.equals(context.getPackageName())) return;
+        String today = new SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(new Date(now));
+        String key = HB_TOTAL_PREFIX + today + "_" + fg;
+        long acc = pm.getLong(key, 0L) + delta;
+        pm.putLong(key, acc);
+        Log.d(TAG, "heartbeatTick fg=" + fg + " +" + (delta / 1000) + "s acc=" + (acc / 1000) + "s");
+    }
+
+    /**
+     * 探测“当前前台包”。两层信号：
+     * 1) ActivityManager.getRunningTasks(1)：MIUI/HyperOS 对持 usage-access 的 App
+     *    常不强制 AOSP 限制，能拿到真实顶层任务；返回自身包名视为不可用，转下层。
+     * 2) queryEvents 回看窗口内最后一条 RESUMED 的包；若窗口内无任何事件（游戏静默
+     *    空窗）则沿用持久化的 last-known 前台包——真实离开必触发他包 RESUMED 覆盖它，
+     *    故“无新事件 = 前台未变”成立。
+     */
+    private String detectForegroundPackage(Context context, long now) {
+        String own = context.getPackageName();
+        // 层一：getRunningTasks
+        try {
+            ActivityManager am = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am != null) {
+                List<ActivityManager.RunningTaskInfo> tasks = am.getRunningTasks(1);
+                if (tasks != null && !tasks.isEmpty()) {
+                    ComponentName top = tasks.get(0).topActivity;
+                    if (top != null) {
+                        String p = top.getPackageName();
+                        if (!TextUtils.isEmpty(p) && !p.equals(own)) {
+                            PreferenceManager.getInstance().putString(PREF_HB_FG, p);
+                            return p;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // 部分 ROM 限制/异常，落到层二
+        }
+        // 层二：queryEvents 回看窗口内最后一条 RESUMED
+        String lastKnown = PreferenceManager.getInstance().getString(PREF_HB_FG);
+        UsageStatsManager manager = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
+        if (manager != null) {
+            try {
+                long from = now - AppConst.HB_FG_LOOKBACK_MS;
+                UsageEvents events = manager.queryEvents(from, now);
+                if (events != null) {
+                    UsageEvents.Event e = new UsageEvents.Event();
+                    String seen = null;
+                    while (events.hasNextEvent()) {
+                        events.getNextEvent(e);
+                        if (e.getEventType() == EVENT_START && !TextUtils.isEmpty(e.getPackageName())) {
+                            seen = e.getPackageName();
+                        }
+                    }
+                    if (!TextUtils.isEmpty(seen) && !seen.equals(own)) {
+                        lastKnown = seen;
+                        PreferenceManager.getInstance().putString(PREF_HB_FG, seen);
+                    }
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "detectForegroundPackage queryEvents error: " + t.getMessage());
+            }
+        }
+        if (!TextUtils.isEmpty(lastKnown) && !lastKnown.equals(own)) return lastKnown;
+        return null;
+    }
+
+    private boolean isScreenInteractive(Context context) {
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(Context.POWER_SERVICE);
+            if (pm == null) return true;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) {
+                return pm.isInteractive();
+            }
+            return pm.isScreenOn();
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    private boolean isSameDay(long a, long b) {
+        String da = new SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(new Date(a));
+        String db = new SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(new Date(b));
+        return da.equals(db);
     }
 
     public void requestPermission(Context context) {
@@ -148,9 +280,10 @@ public class DataManager {
         template.mPackageName = target;
         template.mName = AppUtil.parsePackageName(context.getPackageManager(), target);
 
-        // 直接采用系统 bucket（queryUsageStats 的 totalTimeInForeground）合成一条会话，
-        // 不再自行用 queryEvents 配对。系统 bucket 无逐次开关时间线，故详情页展示为一段。
-        appendTargetFromUsageStats(manager, target, range, template, items);
+        // 主统计源为心跳、系统 bucket 降为兜底：详情页无逐次时间线，合成一段会话，
+        // 当日时长按 max(心跳, bucket) 取值，与实时监控口径一致。
+        long hbMillis = (offset == SortEnum.TODAY.ordinal()) ? heartbeatTodayMillis(target) : 0L;
+        appendTargetFromUsageStats(manager, target, range, template, items, hbMillis);
         return items;
     }
 
@@ -163,10 +296,12 @@ public class DataManager {
         if (manager != null) {
             Log.d(TAG, "Querying events from " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[0]))
                     + " to " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[1])));
-            // 直接采用系统 UsageStatsService 聚合好的 bucket（queryUsageStats 的
-            // totalTimeInForeground）按包汇总，不再自行用 queryEvents 配对统计。
+            // 系统 bucket 作兜底按包聚合；主统计源为心跳（仅当日区间可比）。
             Map<String, AppItem> itemsByPkg = new HashMap<>();
             appendFromUsageStats(manager, range, items, itemsByPkg);
+            if (offset == SortEnum.TODAY.ordinal()) {
+                applyHeartbeat(items, itemsByPkg);
+            }
         } else {
             Log.e(TAG, "UsageStatsManager is null");
         }
@@ -241,6 +376,34 @@ public class DataManager {
             }
         }
         return newList;
+    }
+
+    /**
+     * 将当日心跳时长合入总列表：对已有包取 max(心跳, bucket)；若某监控包在 bucket
+     * 缺失但心跳有值（如 HyperOS 游戏 bucket 几近 0），补建条目，避免主路径漏显。
+     */
+    private void applyHeartbeat(List<AppItem> items, Map<String, AppItem> itemsByPkg) {
+        for (AppItem item : items) {
+            long hb = heartbeatTodayMillis(item.mPackageName);
+            if (hb > item.mUsageTime) {
+                item.mUsageTime = hb;
+                if (item.mCount <= 0) item.mCount = 1;
+            }
+        }
+        String[] monitored = AppConst.MONITOR_PACKAGES;
+        if (monitored != null) {
+            for (String pkg : monitored) {
+                if (TextUtils.isEmpty(pkg) || itemsByPkg.containsKey(pkg)) continue;
+                long hb = heartbeatTodayMillis(pkg);
+                if (hb <= 0) continue;
+                AppItem item = new AppItem();
+                item.mPackageName = pkg;
+                item.mUsageTime = hb;
+                item.mCount = 1;
+                itemsByPkg.put(pkg, item);
+                items.add(item);
+            }
+        }
     }
 
     private Map<String, Long> getMobileData(Context context, TelephonyManager tm, NetworkStatsManager nsm, int offset) {
@@ -340,12 +503,12 @@ public class DataManager {
     }
 
     /**
-     * 详情页时间线（主路径，基于系统 bucket）：合成一条 "fg + bg" 会话，
-     * 时间基于 UsageStats.lastTimeUsed 与 totalTimeInForeground 反推。
+     * 详情页时间线（基于系统 bucket + 心跳）：合成一条 "fg + bg" 会话，
+     * 时长取 max(bucket, hbMillis)，时间基于 UsageStats.lastTimeUsed 与时长反推。
      */
     private void appendTargetFromUsageStats(UsageStatsManager usm, String target,
                                             long[] range, AppItem template,
-                                            List<AppItem> items) {
+                                            List<AppItem> items, long hbMillis) {
         try {
             long dur = 0L;
             long last = 0L;
@@ -358,10 +521,13 @@ public class DataManager {
                     if (us.getLastTimeUsed() > last) last = us.getLastTimeUsed();
                 }
             }
-            if (dur <= 0 || last <= 0) {
-                Log.w(TAG, "queryUsageStats fallback empty for target " + target);
+            // 心跳为主：取更大者作为真实当日时长；last 不可用时以查询边界兜底。
+            if (hbMillis > dur) dur = hbMillis;
+            if (dur <= 0) {
+                Log.w(TAG, "appendTargetFromUsageStats empty for target " + target);
                 return;
             }
+            if (last <= 0) last = range[1];
             long begin = Math.max(range[0], last - dur);
             AppItem fg = template.copy();
             fg.mEventTime = begin;
