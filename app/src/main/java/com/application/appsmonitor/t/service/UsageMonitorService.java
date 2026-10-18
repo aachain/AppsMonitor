@@ -174,17 +174,10 @@ public class UsageMonitorService extends Service {
         DataManager manager = DataManager.getInstance();
         if (manager == null || !manager.hasPermission(this)) return;
 
-        // 方案A 主统计源：先做一次心跳 tick（累加当前前台包的时长），再读当日总时长判断档位。
-        // Handler 轮询与闹钟链都经本方法，两条唤醒路径都会驱动心跳。
-        try {
-            manager.heartbeatTick(this);
-        } catch (Exception e) {
-            // 单次心跳异常不能影响提醒主流程
-        }
-
         String today = new SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(new Date());
         for (String pkg : packages) {
-            long usedMs = manager.getTodayUsageMillis(this, pkg);
+            // 心跳自采：只有目标应用在前台且屏幕亮时才开始累加时长，否则不计时
+            long usedMs = updateHeartbeatUsage(pkg, today);
             int usedMin = (int) (usedMs / 60000L);
             for (int tier : AppConst.MONITOR_TIERS_MIN) {
                 if (usedMin < tier) continue;
@@ -205,6 +198,50 @@ public class UsageMonitorService extends Service {
                 }
             }
         }
+    }
+
+    /**
+     * 按“前台 + 亮屏”规则更新并返回目标包当日累计前台时长（毫秒）。
+     * 规则：
+     *  - 目标应用在前台 且 屏幕亮 → 累加距上次成功采样的实际间隔（封顶 maxDelta）；
+     *  - 否则（切到别的 App / 退桌面 / 熄屏锁屏）→ 不计时，并重置计时基准点，
+     *    使回到前台时从新的一刻起算，不会把空档时间算进来。
+     *  - 首个采样点只记录时间戳不累加（避免把进入前台前的时间算入）。
+     * 累计值与基准时间戳按“包名+日期”持久化，跨天自然从 0 重新计。
+     */
+    private long updateHeartbeatUsage(String pkg, String today) {
+        DataManager dm = DataManager.getInstance();
+        if (dm == null) return 0;
+        long now = System.currentTimeMillis();
+        boolean screenOn = dm.isScreenInteractive(this);
+        boolean inForeground = pkg.equals(
+                dm.getForegroundPackage(this, AppConst.MONITOR_FG_WINDOW_MS));
+
+        String accKey = "hbacc_" + pkg + "_" + today;
+        String tsKey = "hbts_" + pkg + "_" + today;
+        PreferenceManager prefs = PreferenceManager.getInstance();
+        long acc = prefs.getLong(accKey);
+        long last = prefs.getLong(tsKey);
+
+        if (screenOn && inForeground) {
+            if (last == 0) {
+                // 刚进入可计时状态：先立基准点，本拍不累加
+                prefs.putLong(tsKey, now);
+            } else {
+                long delta = now - last;
+                if (delta < 0) delta = 0;
+                if (delta > AppConst.MONITOR_HEARTBEAT_MAX_DELTA_MS) {
+                    delta = AppConst.MONITOR_HEARTBEAT_MAX_DELTA_MS;
+                }
+                acc += delta;
+                prefs.putLong(accKey, acc);
+                prefs.putLong(tsKey, now);
+            }
+        } else {
+            // 不在前台或熄屏：不计时，重置基准点，回前台后从新时刻起算
+            prefs.putLong(tsKey, 0);
+        }
+        return acc;
     }
 
     /**
