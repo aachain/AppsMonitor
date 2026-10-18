@@ -55,6 +55,10 @@ public class DataManager {
     private static final int EVENT_START = UsageEvents.Event.MOVE_TO_FOREGROUND;
     private static final int EVENT_END_PAUSED = UsageEvents.Event.MOVE_TO_BACKGROUND;
     private static final int EVENT_END_STOPPED = 23;
+    // 屏幕事件（全局、无包名）：熄屏作为“用户真正离开”的会话结束信号。
+    // SCREEN_INTERACTIVE(26)/SCREEN_NON_INTERACTIVE(27) 自 API 21 起提供，minSdk22 可用。
+    private static final int EVENT_SCREEN_ON = UsageEvents.Event.SCREEN_INTERACTIVE;
+    private static final int EVENT_SCREEN_OFF = UsageEvents.Event.SCREEN_NON_INTERACTIVE;
     // 单个会话合理上限（4 小时）：HyperOS 漏发 END 时 open session 会被补结算到
     // range[1]；若无上限会把“忘记关的前台应用”膨胀成整天数据。
     private static final long MAX_SESSION_MS = 4L * 3600L * 1000L;
@@ -91,8 +95,8 @@ public class DataManager {
         if (manager == null) return 0;
         long[] range = AppUtil.getTimeRange(SortEnum.TODAY);
         long total = 0;
-        long openStart = 0;
-        boolean seen = false;
+        long openStart = 0;   // >0 表示目标包会话进行中（已 START 未熄屏）
+        boolean seen = false; // 本流是否已为目标包起过会话（含跨零点半开兜底）
         int eventCount = 0;
         try {
             UsageEvents events = manager.queryEvents(range[0], range[1]);
@@ -100,33 +104,40 @@ public class DataManager {
                 UsageEvents.Event event = new UsageEvents.Event();
                 while (events.hasNextEvent()) {
                     events.getNextEvent(event);
-                    if (!pkg.equals(event.getPackageName())) continue;
-                    eventCount++;
                     int type = event.getEventType();
                     long t = event.getTimeStamp();
+                    // 熄屏（全局事件，无包名）：结束当前会话——这是“用户真正离开”的信号
+                    if (type == EVENT_SCREEN_OFF) {
+                        if (openStart > 0) {
+                            long dur = t - openStart;
+                            if (dur < 0) dur = 0;
+                            if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
+                            total += dur;
+                            openStart = 0;
+                            seen = false; // 熄屏后允许重新起会话
+                        }
+                        continue;
+                    }
+                    if (type == EVENT_SCREEN_ON) continue;
+                    if (!pkg.equals(event.getPackageName())) continue;
+                    eventCount++;
                     if (type == EVENT_START) {
-                        // 只跟踪一个进行中的会话：已 open 时忽略重复 START
+                        // 只要没熄屏就只有一个进行中会话：已 open 时忽略重复 START（活动切换/闪屏）
                         if (openStart == 0) {
                             seen = true;
                             openStart = t;
                         }
                     } else if (type == EVENT_END_PAUSED || type == EVENT_END_STOPPED) {
-                        if (openStart == 0) {
-                            // 找不到配对 START：本流已见过 START → 是同一次退出的重复 END（PAUSED/STOPPED 双发），跳过
-                            if (seen) continue;
-                            // 本流从未出现 START 的 END：跨零点半开会话，用 range[0] 兜住起点
+                        // 退后台不结束会话（口径：启动了没退出就一直计时）；
+                        // 仅跨零点半开（本流未起过会话）时用 range[0] 兜起点
+                        if (openStart == 0 && !seen) {
                             seen = true;
                             openStart = range[0];
                         }
-                        long dur = t - openStart;
-                        if (dur < 0) dur = 0;
-                        if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
-                        total += dur;
-                        openStart = 0;
                     }
                 }
             }
-            // 结算仍在前台的当前会话（这正是 queryUsageStats 读不到的那一段）
+            // 边界收尾：查询结束仍未熄屏，结算到 now
             if (openStart > 0 && range[1] > openStart) {
                 long dur = range[1] - openStart;
                 if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
@@ -218,16 +229,26 @@ public class DataManager {
         int pairedSessions = 0;
         UsageEvents events = manager.queryEvents(range[0], range[1]);
         if (events != null) {
-            long start = 0;
-            // 目标 app 是否已在本流内出现 START 或已做过一次半开兑底
-            boolean seen = false;
+            long start = 0;   // >0 目标包会话进行中（已 START 未熄屏）
+            boolean seen = false; // 本流是否已为目标包起过会话（含跨零点半开兜底）
             UsageEvents.Event event = new UsageEvents.Event();
             while (events.hasNextEvent()) {
                 events.getNextEvent(event);
                 totalEvents++;
-                if (!target.equals(event.getPackageName())) continue;
                 int type = event.getEventType();
                 long t = event.getTimeStamp();
+                // 熄屏：结束当前会话（用户真正离开的信号）
+                if (type == EVENT_SCREEN_OFF) {
+                    if (start > 0) {
+                        addTimelineEnd(template, items, start, t);
+                        pairedSessions++;
+                        start = 0;
+                        seen = false;
+                    }
+                    continue;
+                }
+                if (type == EVENT_SCREEN_ON) continue;
+                if (!target.equals(event.getPackageName())) continue;
                 if (type == EVENT_START) {
                     if (start == 0) {
                         seen = true;
@@ -239,48 +260,23 @@ public class DataManager {
                         items.add(fg);
                     }
                 } else if (type == EVENT_END_PAUSED || type == EVENT_END_STOPPED) {
-                    // start==0 且已见过 START，却又收到无配对 START 的 END → 同一次退出的
-                    // 重复 END（PAUSED/STOPPED 双发），跳过，否则会当跨零点半开会话用 range[0] 兜出幽灵时长
-                    if (start == 0 && seen) {
-                        continue;
-                    }
-                    // 半开 session：目标 app 的 START 落在 range[0] 之前，用 range[0] 兜住起点
-                    long s = start > 0 ? start : range[0];
-                    if (t > s) {
-                        if (start == 0) {
-                            seen = true;
-                            // 补一条合成的“前台开始”行，保持详情页成对展示
-                            AppItem fg = template.copy();
-                            fg.mEventTime = s;
-                            fg.mEventType = EVENT_START;
-                            fg.mUsageTime = 0;
-                            items.add(fg);
-                        }
-                        AppItem bg = template.copy();
-                        bg.mEventTime = t;
-                        bg.mEventType = EVENT_END_PAUSED; // 保持与 DetailActivity 现有渲染逻辑一致
-                        long dur = t - s;
-                        if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
-                        bg.mUsageTime = dur;
-                        if (bg.mUsageTime > AppConst.USAGE_TIME_MIX) bg.mCount = 1;
-                        items.add(bg);
-                        pairedSessions++;
-                        start = 0;
+                    // 退后台不结束会话；仅跨零点半开（本流未起过会话）时用 range[0] 兜起点
+                    if (start == 0 && !seen) {
+                        seen = true;
+                        start = range[0];
+                        AppItem fg = template.copy();
+                        fg.mEventTime = start;
+                        fg.mEventType = EVENT_START;
+                        fg.mUsageTime = 0;
+                        items.add(fg);
                     }
                 }
             }
-            // 边界收尾：目标应用仍“前台”则用 range[1] 结算；上限 MAX_SESSION_MS
-            // 避免“忘记关的前台应用”把整天数据高估
+            // 边界收尾：查询结束仍未熄屏，结算到 range[1]
             if (start > 0 && range[1] > start) {
-                AppItem bg = template.copy();
-                bg.mEventTime = range[1];
-                bg.mEventType = EVENT_END_PAUSED;
-                long dur = range[1] - start;
-                if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
-                bg.mUsageTime = dur;
-                if (bg.mUsageTime > AppConst.USAGE_TIME_MIX) bg.mCount = 1;
-                items.add(bg);
+                addTimelineEnd(template, items, start, range[1]);
                 pairedSessions++;
+                start = 0;
             }
         } else {
             Log.w(TAG, "queryEvents returned null for target " + target);
@@ -303,9 +299,10 @@ public class DataManager {
         if (manager != null) {
             Log.d(TAG, "Querying events from " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[0]))
                     + " to " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(range[1])));
+            // 会话起点：目标包 START；结束：熄屏(SCREEN_NON_INTERACTIVE)或查询边界。
+            // 退后台(PAUSED/STOPPED)不结束会话——口径为“启动了没退出就一直计时”。
             Map<String, Long> startPoints = new HashMap<>();
-            // 本事件流内已出现过 START（或已做过一次半开兑底）的包；
-            // 后续“找不到配对 START”的 END 都是重复事件，必须丢弃
+            // 本事件流内已为该包起过会话（含跨 range[0] 半开兜底）的包，避免重复 START/半开
             Set<String> seenPkgs = new HashSet<>();
             Map<String, AppItem> itemsByPkg = new HashMap<>();
             int totalEvents = 0;
@@ -321,85 +318,41 @@ public class DataManager {
                     int eventType = event.getEventType();
                     long eventTime = event.getTimeStamp();
                     String eventPackage = event.getPackageName();
-                    if (TextUtils.isEmpty(eventPackage)) continue;
-                    if (eventType == EVENT_START) {
-                        // 标记该包本流内已 START；同时作为“重复 END”去重依据
-                        seenPkgs.add(eventPackage);
-                        // HyperOS 平板多窗口常见：新应用 RESUMED 到达但旧应用的 END/PAUSED/STOPPED 漏发。
-                        // 先把除当前 pkg 外仍挂在 startPoints 里的“孤儿会话”用当前时刻隐式结算。
+                    // 熄屏（全局事件，无包名）：结束所有仍在进行的会话——“用户真正离开”信号
+                    if (eventType == EVENT_SCREEN_OFF) {
                         Iterator<Map.Entry<String, Long>> it = startPoints.entrySet().iterator();
                         while (it.hasNext()) {
-                            Map.Entry<String, Long> oe = it.next();
-                            String orphanPkg = oe.getKey();
-                            if (orphanPkg.equals(eventPackage)) continue;
-                            long orphanStart = oe.getValue();
-                            if (eventTime > orphanStart) {
-                                AppItem oItem = itemsByPkg.get(orphanPkg);
-                                if (oItem != null) {
-                                    long d = eventTime - orphanStart;
-                                    if (d > MAX_SESSION_MS) d = MAX_SESSION_MS;
-                                    oItem.mEventTime = eventTime;
-                                    oItem.mUsageTime += d;
-                                    if (d > AppConst.USAGE_TIME_MIX) oItem.mCount++;
-                                    pairedSessions++;
-                                }
-                                it.remove();
-                            }
+                            Map.Entry<String, Long> se = it.next();
+                            settleAppSession(itemsByPkg, se.getKey(), se.getValue(), eventTime);
+                            pairedSessions++;
                         }
-                        AppItem item = itemsByPkg.get(eventPackage);
-                        if (item == null) {
-                            item = new AppItem();
-                            item.mPackageName = eventPackage;
-                            itemsByPkg.put(eventPackage, item);
-                            items.add(item);
-                        }
+                        startPoints.clear();
+                        seenPkgs.clear(); // 熄屏后允许重新起会话
+                        continue;
+                    }
+                    if (eventType == EVENT_SCREEN_ON) continue;
+                    if (TextUtils.isEmpty(eventPackage)) continue;
+                    if (eventType == EVENT_START) {
+                        // 只要没熄屏就只有一个进行中会话：已 open 时忽略重复 START（活动切换/闪屏）
                         if (!startPoints.containsKey(eventPackage)) {
                             startPoints.put(eventPackage, eventTime);
+                            seenPkgs.add(eventPackage);
+                            ensureAppItem(items, itemsByPkg, eventPackage);
                         }
                     } else if (eventType == EVENT_END_PAUSED || eventType == EVENT_END_STOPPED) {
-                        Long startObj = startPoints.remove(eventPackage);
-                        if (startObj == null) {
-                            // 没有配对 START：若本流内已见过该包 START，则为重复 END
-                            // （PAUSED/STOPPED 双发，或包切换 cascade 已结算后延迟到达的后台事件），
-                            // 必须跳过，否则会当跨零点半开会话用 range[0] 兜出幽灵时长（如 0:00~2:00）。
-                            if (seenPkgs.contains(eventPackage)) {
-                                continue;
-                            }
-                            // 本流内从未出现 START 的 END：真正跨 range[0] 的半开会话（如昨日 23:00 开启跨过 00:00），
-                            // 标记后用 range[0] 兑底，后续重复 END 会被上面的分支丢弃
+                        // 退后台不结束会话；仅跨 range[0] 的半开（本流未起过会话）用 range[0] 兜起点
+                        if (!startPoints.containsKey(eventPackage) && !seenPkgs.contains(eventPackage)) {
+                            startPoints.put(eventPackage, range[0]);
                             seenPkgs.add(eventPackage);
-                        }
-                        // 半开 session：END 落在窗口内但 START 在窗口之前（跨 range[0]），
-                        // 用 range[0] 兜住起点，避免整段使用被丢弃。
-                        long start = startObj != null ? startObj : range[0];
-                        if (eventTime > start) {
-                            AppItem item = itemsByPkg.get(eventPackage);
-                            if (item == null) {
-                                item = new AppItem();
-                                item.mPackageName = eventPackage;
-                                itemsByPkg.put(eventPackage, item);
-                                items.add(item);
-                            }
-                            long duration = eventTime - start;
-                            if (duration > MAX_SESSION_MS) duration = MAX_SESSION_MS;
-                            item.mEventTime = eventTime;
-                            item.mUsageTime += duration;
-                            if (duration > AppConst.USAGE_TIME_MIX) item.mCount++;
-                            pairedSessions++;
+                            ensureAppItem(items, itemsByPkg, eventPackage);
                         }
                     }
                 }
-                // 边界收尾：查询结束仍在“开始”状态的应用（HyperOS 与平板多窗口常见），
-                // 用 range[1] 结算；上限 MAX_SESSION_MS 避免“忘关的前台应用”高估整天数据
-                for (Map.Entry<String, Long> entry : startPoints.entrySet()) {
-                    AppItem item = itemsByPkg.get(entry.getKey());
-                    if (item == null) continue;
-                    long duration = range[1] - entry.getValue();
-                    if (duration <= 0) continue;
-                    if (duration > MAX_SESSION_MS) duration = MAX_SESSION_MS;
-                    item.mEventTime = range[1];
-                    item.mUsageTime += duration;
-                    if (duration > AppConst.USAGE_TIME_MIX) item.mCount++;
+                // 边界收尾：查询结束仍未熄屏的会话结算到 range[1]（now）
+                Iterator<Map.Entry<String, Long>> sit = startPoints.entrySet().iterator();
+                while (sit.hasNext()) {
+                    Map.Entry<String, Long> entry = sit.next();
+                    settleAppSession(itemsByPkg, entry.getKey(), entry.getValue(), range[1]);
                     pairedSessions++;
                 }
             }
@@ -513,6 +466,43 @@ public class DataManager {
             }
         }
         return result;
+    }
+
+    /**
+     * 详情页：补一条“会话结束(┗)”行，时长 = 结束时刻 - 起始时刻，受 MAX_SESSION_MS 上限。
+     */
+    private void addTimelineEnd(AppItem template, List<AppItem> items, long start, long end) {
+        AppItem bg = template.copy();
+        bg.mEventTime = end;
+        bg.mEventType = EVENT_END_PAUSED; // DetailActivity 据此渲染 ┗ 与时长行
+        long dur = end - start;
+        if (dur < 0) dur = 0;
+        if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
+        bg.mUsageTime = dur;
+        if (bg.mUsageTime > AppConst.USAGE_TIME_MIX) bg.mCount = 1;
+        items.add(bg);
+    }
+
+    private void ensureAppItem(List<AppItem> items, Map<String, AppItem> itemsByPkg, String pkg) {
+        if (itemsByPkg.containsKey(pkg)) return;
+        AppItem item = new AppItem();
+        item.mPackageName = pkg;
+        itemsByPkg.put(pkg, item);
+        items.add(item);
+    }
+
+    /**
+     * 结算一段会话：时长 = 结束 - 起始（受 MAX_SESSION_MS 上限），累加到该包。
+     */
+    private void settleAppSession(Map<String, AppItem> itemsByPkg, String pkg, long start, long end) {
+        AppItem item = itemsByPkg.get(pkg);
+        if (item == null) return;
+        long dur = end - start;
+        if (dur <= 0) return;
+        if (dur > MAX_SESSION_MS) dur = MAX_SESSION_MS;
+        item.mEventTime = end;
+        item.mUsageTime += dur;
+        if (dur > AppConst.USAGE_TIME_MIX) item.mCount++;
     }
 
     private AppItem containItem(List<AppItem> items, String packageName) {
