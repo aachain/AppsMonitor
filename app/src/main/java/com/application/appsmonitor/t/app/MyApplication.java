@@ -16,6 +16,7 @@ import com.application.appsmonitor.t.BuildConfig;
 import com.application.appsmonitor.t.data.AppItem;
 import com.application.appsmonitor.t.data.DataManager;
 import com.application.appsmonitor.t.db.DbHistoryExecutor;
+import com.application.appsmonitor.t.db.DbHeartbeatExecutor;
 import com.application.appsmonitor.t.db.DbIgnoreExecutor;
 import com.application.appsmonitor.t.service.AppService;
 import com.application.appsmonitor.t.service.UsageMonitorService;
@@ -37,11 +38,13 @@ public class MyApplication extends Application {
     public void onCreate() {
         super.onCreate();
         PreferenceManager.init(this);
-        getApplicationContext().startService(new Intent(getApplicationContext(), AppService.class));
-        ContextCompat.startForegroundService(this, new Intent(this, UsageMonitorService.class));
+        // 先完成数据层初始化，再启动服务，避免服务 onCreate 时单例尚未就绪
         DbIgnoreExecutor.init(getApplicationContext());
         DbHistoryExecutor.init(getApplicationContext());
+        DbHeartbeatExecutor.init(getApplicationContext());
         DataManager.init();
+        getApplicationContext().startService(new Intent(getApplicationContext(), AppService.class));
+        ContextCompat.startForegroundService(this, new Intent(this, UsageMonitorService.class));
         addDefaultIgnoreAppsToDB();
         if (AppConst.CRASH_TO_FILE) CrashHandler.getInstance().init();
         // 调度看门狗闹钟 + JobScheduler 周期任务

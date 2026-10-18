@@ -11,7 +11,7 @@ import android.database.sqlite.SQLiteOpenHelper;
 
 public class DbHelper extends SQLiteOpenHelper {
 
-    private static final int DATABASE_VERSION = 2;
+    private static final int DATABASE_VERSION = 3;
     private static final String DATABASE_NAME = DbConst.DATABASE_NAME;
 
     private static final String SQL_CREATE_IGNORE =
@@ -31,11 +31,22 @@ public class DbHelper extends SQLiteOpenHelper {
                     DbConst.TableHistory.FIELD_TIMESTAMP + " INTEGER," +
                     DbConst.TableHistory.FIELD_DURATION + " INTEGER)";
 
+    private static final String SQL_CREATE_HEARTBEAT =
+            "CREATE TABLE " + DbConst.TableHeartbeat.TABLE_NAME + " (" +
+                    DbConst.TableHeartbeat._ID + " INTEGER PRIMARY KEY AUTOINCREMENT," +
+                    DbConst.TableHeartbeat.FIELD_PACKAGE_NAME + " TEXT," +
+                    DbConst.TableHeartbeat.FIELD_DAY + " TEXT," +
+                    DbConst.TableHeartbeat.FIELD_START + " INTEGER," +
+                    DbConst.TableHeartbeat.FIELD_END + " INTEGER)";
+
     private static final String SQL_DELETE_IGNORE =
             "DROP TABLE IF EXISTS " + DbConst.TableIgnore.TABLE_NAME;
 
     private static final String SQL_DELETE_HISTORY =
-            "DROP TABLE IF EXISTS " + DbConst.TableIgnore.TABLE_NAME;
+            "DROP TABLE IF EXISTS " + DbConst.TableHistory.TABLE_NAME;
+
+    private static final String SQL_DELETE_HEARTBEAT =
+            "DROP TABLE IF EXISTS " + DbConst.TableHeartbeat.TABLE_NAME;
 
     DbHelper(Context context) {
         super(context, DATABASE_NAME, null, DATABASE_VERSION);
@@ -44,11 +55,13 @@ public class DbHelper extends SQLiteOpenHelper {
     public void onCreate(SQLiteDatabase db) {
         db.execSQL(SQL_CREATE_IGNORE);
         db.execSQL(SQL_CREATE_HISTORY);
+        db.execSQL(SQL_CREATE_HEARTBEAT);
     }
 
     public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
         db.execSQL(SQL_DELETE_IGNORE);
         db.execSQL(SQL_DELETE_HISTORY);
+        db.execSQL(SQL_DELETE_HEARTBEAT);
         onCreate(db);
     }
 

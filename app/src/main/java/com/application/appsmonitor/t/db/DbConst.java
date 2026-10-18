@@ -31,4 +31,16 @@ final class DbConst {
         static final String FIELD_MOBILE_TRAFFIC = "mobile";
     }
 
+    /**
+     * 心跳会话表：全系统唯一的时长真相源。
+     * 一行 = 一段“某应用在前台且屏幕亮”的连续会话。
+     */
+    static class TableHeartbeat implements BaseColumns {
+        static final String TABLE_NAME = "heartbeat_session";
+        static final String FIELD_PACKAGE_NAME = "package_name";
+        static final String FIELD_DAY = "day";
+        static final String FIELD_START = "start_ts";
+        static final String FIELD_END = "end_ts";
+    }
+
 }
