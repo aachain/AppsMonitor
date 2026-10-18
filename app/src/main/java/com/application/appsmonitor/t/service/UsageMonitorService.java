@@ -174,6 +174,14 @@ public class UsageMonitorService extends Service {
         DataManager manager = DataManager.getInstance();
         if (manager == null || !manager.hasPermission(this)) return;
 
+        // 方案A 主统计源：先做一次心跳 tick（累加当前前台包的时长），再读当日总时长判断档位。
+        // Handler 轮询与闹钟链都经本方法，两条唤醒路径都会驱动心跳。
+        try {
+            manager.heartbeatTick(this);
+        } catch (Exception e) {
+            // 单次心跳异常不能影响提醒主流程
+        }
+
         String today = new SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(new Date());
         for (String pkg : packages) {
             long usedMs = manager.getTodayUsageMillis(this, pkg);
