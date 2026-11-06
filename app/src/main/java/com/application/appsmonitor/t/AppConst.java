@@ -20,16 +20,15 @@ public final class AppConst {
             "com.netease.party",    // 网易·蛋仔派对
     };
     // 每日使用上限（分钟），用于计算“还剩多少分钟”，同时也是触发拉黑的阈值
-    public static final int MONITOR_DAILY_LIMIT_MIN = 120;
+    public static final int MONITOR_DAILY_LIMIT_MIN = 60;
     // 固定提醒档位（已用分钟数达到即提醒一次，同日同档不重复）
     // 【测试配置】每 5 分钟提醒一次；测试交付前改回真实档位，
     // 并先清除 App 数据（去重键在 SharedPreferences里会跨重启保留）。
     public static final int[] MONITOR_TIERS_MIN = {
-            5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
-            65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120
+            5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60
     };
     // 真实交付时应改回下列稀疏档位：
-    // public static final int[] MONITOR_TIERS_MIN = {1, 20, 55, 115};
+    // public static final int[] MONITOR_TIERS_MIN = {1, 20, 40, 55};
     // 轮询间隔（毫秒）
     public static final long MONITOR_CHECK_INTERVAL_MS = 60 * 1000L;
     // 每分钟精确唤醒闹钟的 action（由系统 AlarmManager 触发，应用退后台/被杀也能弹提醒）
